@@ -3242,12 +3242,17 @@ pub(crate) fn read_dns_name(packet: &[u8], offset: &mut usize) -> io::Result<Str
     read_dns_name_limited(packet, offset, packet.len())
 }
 
+/// The longest name, its labels each with a dot after it, that Go's
+/// `dnsmessage` reads, as RFC 1035 bounds a name to 255 octets on the wire.
+const DNS_NAME_MAX: usize = 254;
+
 fn read_dns_name_limited(packet: &[u8], offset: &mut usize, limit: usize) -> io::Result<String> {
     if limit > packet.len() || *offset > limit {
         return Err(invalid_dns_response("invalid dns name limit"));
     }
 
     let mut labels = Vec::new();
+    let mut name_len = 0;
     let mut cursor = *offset;
     let mut jumped = false;
 
@@ -3296,6 +3301,12 @@ fn read_dns_name_limited(packet: &[u8], offset: &mut usize, limit: usize) -> io:
         if label_end > packet.len() {
             return Err(invalid_dns_response("truncated dns label"));
         }
+        // Thirty-odd labels behind one pointer make a name of ~2 KB, which
+        // every record of a 64 KB answer could point at and copy.
+        name_len += label_len + 1;
+        if name_len > DNS_NAME_MAX {
+            return Err(invalid_dns_response("dns name exceeds 255 octets"));
+        }
         let label = std::str::from_utf8(&packet[cursor..label_end])
             .map_err(|_| invalid_dns_response("dns label is not utf-8"))?;
         labels.push(label.to_ascii_lowercase());
@@ -3321,6 +3332,50 @@ fn read_u32(packet: &[u8], offset: usize) -> io::Result<u32> {
 
 fn invalid_dns_response(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Feeds `data` to the resolver's response checks as a reply to an A or
+/// AAAA query. With the selector's second bit set the reply takes the
+/// query's ID and question, so the answer section is reached on every run.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_response(data: &[u8]) {
+    let Some((&selector, response)) = data.split_first() else {
+        return;
+    };
+    let record_type = if selector & 1 == 0 {
+        DnsRecordType::A
+    } else {
+        DnsRecordType::Aaaa
+    };
+    let id = u16::from_be_bytes([
+        response.first().copied().unwrap_or_default(),
+        response.get(1).copied().unwrap_or_default(),
+    ]);
+    let edns = if selector & 4 != 0 {
+        edns_opt_record(None, DOH_PADDING_MIN)
+    } else {
+        None
+    };
+    let Ok(query) = build_dns_query_with_id("origin.example", record_type, id, edns.as_deref())
+    else {
+        return;
+    };
+    let _ = dns_response_matches_query(&query, response);
+    let _ = parse_dns_response(&query, response, record_type);
+
+    if selector & 2 != 0 && response.len() >= 4 {
+        // The query's ID and question around the fuzzed flags, counts and
+        // records: what an on-path forger that saw the query sends.
+        let question_end = query.len() - edns.as_ref().map_or(0, Vec::len);
+        let mut forged = query[..2].to_vec();
+        forged.extend_from_slice(&[response[2] | 0x80, response[3]]);
+        forged.extend_from_slice(&1_u16.to_be_bytes());
+        forged.extend_from_slice(response.get(4..10).unwrap_or(&[0, 1, 0, 0, 0, 0]));
+        forged.extend_from_slice(&query[12..question_end]);
+        forged.extend_from_slice(response.get(10..).unwrap_or_default());
+        let _ = dns_response_matches_query(&query, &forged);
+        let _ = parse_dns_response(&query, &forged, record_type);
+    }
 }
 
 #[cfg(test)]
@@ -4333,6 +4388,62 @@ mod tests {
                 },
             ))
         );
+    }
+
+    #[test]
+    fn dns_names_past_255_octets_do_not_parse() {
+        let wire_name = |last: usize| {
+            let mut name = Vec::new();
+            for length in [63, 63, 63, last] {
+                name.push(length as u8);
+                name.extend(std::iter::repeat_n(b'a', length));
+            }
+            name.push(0);
+            name
+        };
+        let longest = wire_name(61);
+        assert_eq!(longest.len(), 255);
+        let mut offset = 0;
+        assert_eq!(
+            super::read_dns_name(&longest, &mut offset).unwrap().len(),
+            253
+        );
+        assert_eq!(offset, 255);
+        assert!(super::read_dns_name(&wire_name(62), &mut 0).is_err());
+
+        // A forged answer whose records all point at one ~2 KB owner name:
+        // each would keep its own copy, some 8 MB for a 64 KB answer.
+        let query = build_dns_query_with_id("origin.example", DnsRecordType::A, 0xA181, None)
+            .expect("build query");
+        let answer = |owner: &[u8]| {
+            let mut record = owner.to_vec();
+            record.extend_from_slice(&1_u16.to_be_bytes());
+            record.extend_from_slice(&1_u16.to_be_bytes());
+            record.extend_from_slice(&60_u32.to_be_bytes());
+            record.extend_from_slice(&4_u16.to_be_bytes());
+            record.extend_from_slice(&[192, 0, 2, 87]);
+            record
+        };
+        let mut response = build_test_address_response(&query, &[]);
+        let long_owner = response.len();
+        let mut owner = Vec::new();
+        for _ in 0..30 {
+            owner.push(63);
+            owner.extend_from_slice(&[b'a'; 63]);
+        }
+        owner.push(0);
+        response.extend(answer(&owner));
+        let pointer = 0xC000 | u16::try_from(long_owner).unwrap();
+        let mut count = 1_u16;
+        while response.len() + 16 <= usize::from(u16::MAX) {
+            response.extend(answer(&pointer.to_be_bytes()));
+            count += 1;
+        }
+        response[6..8].copy_from_slice(&count.to_be_bytes());
+
+        let error = parse_dns_response(&query, &response, DnsRecordType::A).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "dns name exceeds 255 octets");
     }
 
     #[test]
