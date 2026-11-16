@@ -175,6 +175,25 @@ long-term supported release series.
   `pinnedPeerCertSha256` and still fails without one, since ignoring it would
   trust roots the config turned off. Values Go's decoding refuses, and
   unknown keys, still fail.
+- A WireGuard device or MASQUE tunnel no longer refuses a TCP flow past its
+  limit at once. The flow waits for an earlier one to close, in arrival
+  order, for up to ten seconds, and only then tries its addresses, so the
+  wait does not spend an address's three-second attempt. At most twice the
+  limit may wait; past that, or after the ten seconds, the flow is refused
+  as an exhausted flow budget, which does not count against the outbound's
+  health, and a waiting flow that is cancelled leaves the queue at once.
+  The limit follows the TUN runtime profile, each flow's buffers sized with
+  it: 32 flows of 256 KiB each way on `LowMemory` (16 MiB), 64 of 256 KiB on
+  `Mobile` and `MobilePlus` (32 MiB, what 16 flows of 1 MiB took), 128 of
+  1 MiB on `Desktop` and `Throughput`; `Default` follows the target. Each
+  tunnel took 16 TCP flows, idle ones included, and refused the seventeenth,
+  so a phone browser, which opens more for one page and keeps them open,
+  broke pages over WARP and WireGuard. On the phone profiles one flow's
+  receive window is now at most 256 KiB, which bounds a single download to
+  256 KiB a round trip. `xray-wireguard` adds `FlowLimits`,
+  `Client::start_with_limits`, `Netstack::start_with_limits`, `tcp_slot`,
+  `connect_with_slot` and `waiting_tcp_flows`; the existing constructors take
+  the target's limits.
 - A Hysteria connect attempt to the last of the server's addresses, the only
   one for a server with one address, gets what is left of the dial's ten
   seconds, at most eight, where every attempt had three. Quinn's first probe
