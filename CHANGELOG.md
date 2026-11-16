@@ -45,6 +45,16 @@ long-term supported release series.
   `leastPing` balancer with `probeInterval: "10m"` was kept for up to ten
   minutes; it is now left after one failed open and two failed probes.
   Without failures the observatory probes as before.
+- The TUN loop no longer wakes every second. It slept at most a second for
+  its statistics, so an idle VPN, with no flows or only idle ones, woke the
+  process 45 to 50 times a minute where the same core without TUN woke none
+  (measured on macOS). It now sleeps until a packet, a flow event, smoltcp's
+  next timer or a housekeeping deadline: the close-wait sweep, the expiry of
+  a pooled DNS-over-TCP connection, and the TCP buffer statistics, recorded
+  a second after activity and every second while upload bytes wait for their
+  outbound. Retransmissions, delayed ACKs, the 30-second linger, the
+  four-minute give-up and UDP idle eviction keep their timing, and the
+  statistics are still at most a second behind the last activity.
 
 - A WireGuard device or MASQUE tunnel no longer refuses a TCP flow past its
   limit at once. The flow waits for an earlier one to close, in arrival
