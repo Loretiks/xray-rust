@@ -6889,6 +6889,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: domain_tcp_target("proxy.example"),
                     transport: ConnectorConfig::Tcp,
@@ -10331,6 +10332,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -10377,6 +10379,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -10441,6 +10444,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -10530,6 +10534,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -10614,6 +10619,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -10685,6 +10691,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -10779,6 +10786,7 @@ mod tests {
                     xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
+                    domain_strategy: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
