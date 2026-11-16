@@ -45,8 +45,9 @@ use crate::fake_dns::FakeIpMapper;
 use crate::outbound::{
     absorb_udp_datagrams_until, final_rules, open_tcp_stream_with_resolvers_and_dialer,
     open_vless_udp_stream_with_resolver_dialer_and_options, proxy_protocol, DnsOutbound,
-    DomainStrategyResolver, FreedomOutbound, InboundSource, TcpOutbound, TcpSessionOutbound,
-    UdpOutbound, UdpSessionOutbound, VlessTcpOutbound, VlessUdpFraming, VlessUdpOpenOptions,
+    DomainStrategyResolver, FreedomOutbound, InboundSource, OutboundNodeId, TcpOutbound,
+    TcpSessionOutbound, UdpOutbound, UdpSessionOutbound, VlessTcpOutbound, VlessUdpFraming,
+    VlessUdpOpenOptions,
 };
 use crate::policy::{effective_policy_for_level, EffectivePolicy};
 use crate::udp_ingress::{sniff_udp_flow, UdpIngress};
@@ -3498,6 +3499,7 @@ async fn bridge_tcp_flow_inner(
             Ok((
                 TcpSessionOutbound::Transport(TcpOutbound::Freedom(FreedomOutbound::default())),
                 None,
+                None,
             ))
         } else {
             tokio::select! {
@@ -3514,7 +3516,11 @@ async fn bridge_tcp_flow_inner(
                                     true,
                                 )
                                 .map(|selection| {
-                                    (TcpSessionOutbound::Transport(selection.outbound), selection.tag)
+                                    (
+                                        TcpSessionOutbound::Transport(selection.outbound),
+                                        selection.tag,
+                                        Some(selection.node),
+                                    )
                                 })
                         } else {
                             context.outbound_router
@@ -3526,7 +3532,9 @@ async fn bridge_tcp_flow_inner(
                                     context.dns_resolver.as_ref(),
                                 )
                                 .await
-                                .map(|selection| (selection.outbound, selection.tag))
+                                .map(|selection| {
+                                    (selection.outbound, selection.tag, Some(selection.node))
+                                })
                         }
                     };
                     if let Some(remaining) = selection_remaining {
@@ -3540,9 +3548,9 @@ async fn bridge_tcp_flow_inner(
                 } => result,
             }
         };
-        let (outbound, outbound_tag) = match outbound_result {
-            Ok((TcpSessionOutbound::Transport(outbound), tag)) => (outbound, tag),
-            Ok((TcpSessionOutbound::Blackhole(blackhole), outbound_tag)) => {
+        let (outbound, outbound_tag, outbound_node) = match outbound_result {
+            Ok((TcpSessionOutbound::Transport(outbound), tag, node)) => (outbound, tag, node),
+            Ok((TcpSessionOutbound::Blackhole(blackhole), outbound_tag, _)) => {
                 drop(pending_open);
                 blackhole::finish_blackholed_tcp_flow(
                     blackhole::BlackholedTcpFlow {
@@ -3563,7 +3571,7 @@ async fn bridge_tcp_flow_inner(
                 return;
             }
             // A DNS handler is not a byte-stream transport for this flow.
-            Ok((TcpSessionOutbound::Dns(_), _)) => {
+            Ok((TcpSessionOutbound::Dns(_), _, _)) => {
                 last_failure = Some((crate::CoreError::NoSupportedOutbound.to_string(), None));
                 continue;
             }
@@ -3661,9 +3669,17 @@ async fn bridge_tcp_flow_inner(
                 break;
             }
             Ok(Err(error)) => {
+                if let Some(node) = outbound_node {
+                    context.outbound_router.report_open_error(node, &error);
+                }
                 last_failure = Some((error.to_string(), outbound_tag));
             }
             Err(_) => {
+                // A DNS upstream's share of the query deadline can be shorter
+                // than the outbound's handshake, and says nothing about it.
+                if let (Some(node), None) = (outbound_node, candidate_deadline) {
+                    context.outbound_router.report_open_timeout(node);
+                }
                 last_failure = Some((
                     format!(
                         "outbound open timed out after {} ms",
@@ -4952,6 +4968,7 @@ async fn bridge_udp_flow(
                 generation,
                 dial_target,
                 outbound,
+                selected.node,
                 context,
                 from_stack,
                 shutdown,
@@ -4970,6 +4987,7 @@ async fn bridge_udp_flow(
                 generation,
                 dial_target,
                 outbound,
+                selected.node,
                 context,
                 from_stack,
                 shutdown,
@@ -5490,6 +5508,7 @@ async fn bridge_udp_vless_flow(
     generation: u64,
     target: Target,
     outbound: Box<VlessTcpOutbound>,
+    node: OutboundNodeId,
     context: TunRuntimeContext,
     from_stack: UdpIngress,
     shutdown: watch::Receiver<bool>,
@@ -5522,6 +5541,7 @@ async fn bridge_udp_vless_flow(
     let (stream, framing) = match opened {
         Ok(opened) => opened,
         Err(error) => {
+            context.outbound_router.report_open_error(node, &error);
             if context.runtime_logger.is_enabled() {
                 crate::debug_log::log_access_rejected(
                     &context.runtime_logger,
