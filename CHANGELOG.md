@@ -124,6 +124,57 @@ long-term supported release series.
   `DomainMatcherSet` equality now compares normalized patterns, however they
   are stored, and `DomainMatcherSetError` has a `TooLarge` variant for a
   table beyond 4 GiB.
+- `dns.servers` takes up to 32 entries, where more than eight failed to
+  parse. Xray-core sets no limit, and full subscriptions list more than
+  eight. Destination lookups use every server; the TUN DNS proxy at
+  `198.18.0.1` still forwards to the first eight distinct ones, which share
+  its five-second budget.
+- RAW's `http` header obfuscation works (`tcpSettings`/`rawSettings`
+  `header.type: "http"`), where it was refused: every connection sends a
+  request head built as Xray-core builds it (method, a drawn path, headers
+  sorted by name with drawn values, or Xray-core's Chrome headers by default)
+  before its first bytes, above TLS or REALITY when set, and drops the
+  server's response head, at most 8192 bytes, before its first read. Vision
+  is refused on it, as in Xray-core. Request text with a carriage return or
+  line feed fails.
+- Xray-core's FakeDNS works: a `fakedns` entry in `dns.servers`, refused
+  until now, turns on `dns.fakeIp` with the first IPv4 pool of root
+  `fakeDns` (an object or an array, also spelled `fakedns`) and its
+  `poolSize`, or Xray-core's automatic `198.18.0.0/15` without one.
+  Destination lookups never ask the entry. IPv6 pools are ignored with a
+  warning, as fake addresses are IPv4 only, and every name gets a fake
+  address, with a warning where Xray-core's server plan would have left some
+  names to other servers. An explicit `dns.fakeIp` wins.
+- `sockopt.domainStrategy` works on VLESS, VMess, Trojan, Shadowsocks, SOCKS,
+  HTTP and Hysteria outbounds and on an XHTTP download leg, where any value
+  but `AsIs` was refused. A domain server resolves to the families the
+  strategy asks for before it is dialed, as Xray-core's `DialSystem` resolves
+  it: `UseIPv4` dials only IPv4 addresses and falls back to all of them when
+  there is none, `ForceIPv4` fails instead, and the `v4v6`/`v6v4` forms try
+  one family, then the other. The bootstrap resolver answers, as without a
+  strategy. A strategy beside `dialerProxy` or `proxySettings` on such an
+  outbound is refused, since the chain would carry the server's name.
+- `localhost` works as a DNS server, as Xray-core's system-resolver client,
+  where it was refused. It asks the resolver the core bootstraps with
+  (`dns.hosts`, then the platform resolver) instead of the wire, bypassing
+  routing, and its `domains` gain Xray-core's local rules, so dotless names
+  and `.local`, `.lan`, `.home.arpa` and the reserved suffixes go to it
+  first. Answers carry the platform's TTL or Xray-core's 300 seconds and are
+  cached like other servers'. Under the `StaticOnly` bootstrap mode it answers
+  only from `dns.hosts`, and the next server takes the other names. The TUN
+  DNS proxy asks it locally over UDP and TCP.
+- Full Xray JSON subscriptions with fields Xray-core accepts and that change
+  nothing here now start, with a warning for each, where they failed to
+  parse: root `stats`, `api`, `metrics`, `version` and `geodata` objects,
+  `routing.domainMatcher`, `sockopt.tcpNoDelay`, mKCP `congestion`,
+  `readBufferSize` and `writeBufferSize`, and TLS `minVersion`, `maxVersion`,
+  `cipherSuites`, `curvePreferences`, `useSystemCA` and `show`. A uTLS
+  fingerprint decides the TLS four, as in Xray-core. `echConfigList` is
+  accepted without ECH, so the server name goes out in the clear, as its
+  warning says. `disableSystemRoot: true` is accepted only beside
+  `pinnedPeerCertSha256` and still fails without one, since ignoring it would
+  trust roots the config turned off. Values Go's decoding refuses, and
+  unknown keys, still fail.
 - A Hysteria connect attempt to the last of the server's addresses, the only
   one for a server with one address, gets what is left of the dial's ten
   seconds, at most eight, where every attempt had three. Quinn's first probe
