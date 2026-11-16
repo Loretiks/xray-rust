@@ -15,7 +15,9 @@ use smoltcp::iface::{
     Config as InterfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle,
     SocketSet,
 };
-use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpEndpoint};
@@ -50,7 +52,7 @@ use crate::outbound::{
     VlessUdpOpenOptions,
 };
 use crate::policy::{effective_policy_for_level, EffectivePolicy};
-use crate::udp_ingress::{sniff_udp_flow, UdpIngress};
+use crate::udp_ingress::{sniff_udp_flow, QueuedBytes, QueuedDatagram, UdpIngress};
 use crate::{
     OutboundRouter, RuntimeLogger, TunAdmissionPolicy, TunRuntimeOptions, TunRuntimeProfile,
 };
@@ -72,6 +74,10 @@ const DNS_RCODE_SERVFAIL: u16 = 2;
 pub(crate) const TUN_DNS_ANCHOR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 pub(crate) const TUN_CLIENT_IPV4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 const TCP_BUFFER_SIZE: usize = 32 * 1024;
+/// Receive buffer a TUN TCP socket starts with, until its bridge takes the
+/// client's data: room for a TLS ClientHello or an HTTP request. The send
+/// buffer starts empty, until the remote's first data.
+const TCP_INITIAL_RX_BUFFER_SIZE: usize = 8 * 1024;
 /// IPv4 and TCP headers without options: the largest MSS a link MTU admits.
 const TCP_IPV4_HEADERS_LEN: usize = 40;
 const TUN_TCP_SNIFF_BUFFER_SIZE: usize = 8 * 1024;
@@ -83,7 +89,8 @@ const LOW_MEMORY_TCP_BRIDGE_CHANNEL_DEPTH: usize = 64;
 const PACKET_TRANSPORT_UPLOAD_QUEUE_PACKETS: usize = 8;
 const PACKET_TRANSPORT_UPLOAD_BATCH_BYTES: usize = 64 * 1024;
 // Burst-heavy UDP (DNS fan-out, QUIC fallback retries) overflows a 64-deep
-// channel and surfaces as udp_channel_dropped_packets.
+// channel and surfaces as udp_channel_dropped_packets. The profile's byte
+// limits (`UdpFlowBudgetPolicy`) bound the same queues by size.
 const UDP_BRIDGE_CHANNEL_DEPTH: usize = 256;
 const BRIDGE_READ_BUFFER_SIZE: usize = 16 * 1024;
 // A small pipeline hides stack/task scheduling latency without allowing an
@@ -194,6 +201,11 @@ const MOBILE_PLUS_TCP_REMOTE_BUFFER_POLICY: TcpRemoteBufferPolicy = TcpRemoteBuf
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UdpFlowBudgetPolicy {
     max_active_flows: usize,
+    /// Payload bytes one flow's queue to its bridge may hold.
+    max_queued_bytes_per_flow: usize,
+    /// Payload bytes the queues of all flows may hold together. A datagram
+    /// over either limit is dropped like one that finds its queue full.
+    max_queued_bytes_total: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +248,10 @@ const MOBILE_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
         // Speedtests and DNS-heavy bursts easily exceed 256 concurrent UDP
         // flows; dropping fresh flows shows up as failed probes.
         max_active_flows: 512,
+        // 256 queued datagrams of a 1500-byte MTU are about 360 KiB per flow,
+        // and 512 such flows about 180 MiB.
+        max_queued_bytes_per_flow: 128 * 1024,
+        max_queued_bytes_total: 4 * 1024 * 1024,
     },
 };
 
@@ -247,6 +263,8 @@ const MOBILE_PLUS_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     },
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 512,
+        max_queued_bytes_per_flow: 256 * 1024,
+        max_queued_bytes_total: 8 * 1024 * 1024,
     },
 };
 
@@ -258,6 +276,9 @@ const DESKTOP_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     },
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 1024,
+        // Above the 256 datagrams a 1500-byte MTU fits in.
+        max_queued_bytes_per_flow: 512 * 1024,
+        max_queued_bytes_total: 64 * 1024 * 1024,
     },
 };
 
@@ -275,6 +296,8 @@ const LOW_MEMORY_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     },
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 128,
+        max_queued_bytes_per_flow: 64 * 1024,
+        max_queued_bytes_total: 2 * 1024 * 1024,
     },
 };
 
@@ -286,6 +309,8 @@ const THROUGHPUT_FLOW_BUDGET_POLICY: FlowBudgetPolicy = FlowBudgetPolicy {
     },
     udp: UdpFlowBudgetPolicy {
         max_active_flows: 2048,
+        max_queued_bytes_per_flow: 1024 * 1024,
+        max_queued_bytes_total: 128 * 1024 * 1024,
     },
 };
 
@@ -580,6 +605,8 @@ struct FlowBudgetState {
     udp_budget_drops: u64,
     udp_evicted_flows: u64,
     udp_channel_dropped_packets: u64,
+    /// Payload bytes queued to the bridges of all UDP flows.
+    udp_queued_bytes: Arc<AtomicUsize>,
     /// Set by the latest remote write pass when a closed remote's FIN waits
     /// for the client's handshake ACK.
     tcp_fin_waits_for_handshake: bool,
@@ -787,6 +814,7 @@ impl FlowBudgetState {
             udp_budget_drops: 0,
             udp_evicted_flows: 0,
             udp_channel_dropped_packets: 0,
+            udp_queued_bytes: Arc::new(AtomicUsize::new(0)),
             tcp_fin_waits_for_handshake: false,
         }
     }
@@ -960,6 +988,19 @@ impl FlowBudgetState {
 
     fn record_udp_channel_drop(&mut self) {
         self.udp_channel_dropped_packets = self.udp_channel_dropped_packets.saturating_add(1);
+    }
+
+    /// The byte count of a new flow's datagram queue, in this runtime's total.
+    fn udp_queued_bytes_for_new_flow(&self) -> Arc<QueuedBytes> {
+        Arc::new(QueuedBytes::new(Arc::clone(&self.udp_queued_bytes)))
+    }
+
+    /// Whether `len` more payload bytes fit in a flow's queue that holds
+    /// `queued`, and in the queues of all flows.
+    fn udp_queue_has_room(&self, queued: &QueuedBytes, len: usize) -> bool {
+        let policy = self.policy.udp;
+        queued.flow().saturating_add(len) <= policy.max_queued_bytes_per_flow
+            && queued.total().saturating_add(len) <= policy.max_queued_bytes_total
     }
 
     fn record_udp_budget_drop(&mut self) {
@@ -1538,7 +1579,7 @@ async fn process_tun_packet(
                 };
                 udp_tasks.spawn(dns_proxy::bridge_udp_query(
                     plan,
-                    udp_packet,
+                    udp_packet.detached(),
                     context.clone(),
                     shutdown,
                     global_permit,
@@ -1572,7 +1613,7 @@ async fn process_tun_packet(
                     outbound,
                     decision,
                     client_target,
-                    udp_packet,
+                    udp_packet.detached(),
                     context.clone(),
                     shutdown,
                     global_permit,
@@ -2007,7 +2048,9 @@ impl Drop for TcpBridgeCloseGuard {
 
 #[derive(Debug)]
 struct UdpFlow {
-    to_remote: mpsc::Sender<Bytes>,
+    to_remote: mpsc::Sender<QueuedDatagram>,
+    /// The payload bytes waiting in `to_remote`.
+    queued: Arc<QueuedBytes>,
     generation: u64,
     last_used_sequence: u64,
     task: Option<AbortHandle>,
@@ -2076,6 +2119,19 @@ struct UdpTunPacket {
     client: IpEndpoint,
     target: IpEndpoint,
     payload: Bytes,
+}
+
+impl UdpTunPacket {
+    /// The packet with a payload of its own. A packet read from a TUN
+    /// descriptor shares one read buffer with the packets around it (64 KiB
+    /// on Darwin and Linux), and a payload kept past the packet's turn would
+    /// keep all of it alive.
+    fn detached(self) -> Self {
+        Self {
+            payload: Bytes::copy_from_slice(&self.payload),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2823,6 +2879,9 @@ fn write_remote_data_to_sockets(
             socket.abort();
             continue;
         }
+        if !flow.pending_remote.is_empty() {
+            grow_tcp_send_buffer(socket);
+        }
         while socket.can_send() {
             let Some(front) = flow.pending_remote.front_mut() else {
                 break;
@@ -2895,6 +2954,7 @@ fn read_socket_data_to_remote(
             continue;
         };
         let socket = sockets.get_mut::<tcp::Socket>(*handle);
+        grow_tcp_recv_buffer(socket, rx_buffer_size);
         while socket.can_recv() {
             if flow.upload_queue_full() {
                 flow_budget_state
@@ -4108,14 +4168,13 @@ where
     W: AsyncWrite + Unpin,
     T: TcpFirstByteTiming,
 {
-    let mut read_buffer = vec![0; TCP_DOWNLOAD_CHUNK_SIZE];
     let mut pending_download: Option<PendingDownload<'_>> = None;
     let mut remote_read_end = None;
     let mut upload_open = true;
     let mut active_idle_timeout = idle_timeout;
     let upload_policy = context.runtime_policy.tcp_upload;
     let mut upload_batch = BytesMut::new();
-    let mut upload_reservations = Vec::with_capacity(upload_policy.max_batch_messages.min(64));
+    let mut upload_reservations = Vec::new();
     // Keep the current upload batch alive across download/cancellation polls,
     // but return to select after each completed batch. An unbounded upload
     // loop consumes the task's cooperative budget before download can run.
@@ -4208,8 +4267,9 @@ where
                     }
                     idle_sleep.as_mut().reset(TokioInstant::now() + active_idle_timeout);
                 }
-                (read, end) = read_remote_batch(remote_reader, &mut read_buffer), if pending_download.is_none() => {
+                (data, end) = read_remote_batch(remote_reader, TCP_DOWNLOAD_CHUNK_SIZE), if pending_download.is_none() => {
                     remote_read_end = end;
+                    let read = data.len();
                     if read == 0 {
                         continue;
                     }
@@ -4219,11 +4279,7 @@ where
                     timing.record_remote_read(context.tun.as_ref(), target, read);
                     pending_download = Some(Box::pin(await_with_optional_timeout(
                         operation_timeout,
-                        context.send_remote_data(
-                            handle,
-                            generation,
-                            Bytes::copy_from_slice(&read_buffer[..read]),
-                        ),
+                        context.send_remote_data(handle, generation, data),
                     )));
                     idle_sleep
                         .as_mut()
@@ -4700,7 +4756,12 @@ where
     if write_result.is_ok() && !batch.is_empty() {
         write_result = remote_writer.write_all(batch).await;
     }
-    batch.clear();
+    if from_stack.is_empty() {
+        // Nothing waits to be coalesced: an idle flow keeps no copy buffer.
+        *batch = BytesMut::new();
+    } else {
+        batch.clear();
+    }
     let write_duration_ms = elapsed_ms_since(&write_start);
     tun.record_tcp_remote_write_wait(write_duration_ms);
     record_tcp_remote_write_slow_event(
@@ -4753,6 +4814,9 @@ fn handle_udp_packet(
                 .tun_runtime_options
                 .collect_tcp_timings
                 .then(StdInstant::now);
+            // Kept for an ICMP reply until the flow is routed; see
+            // `UdpTunPacket::detached`.
+            let original_packet = Bytes::copy_from_slice(&original_packet);
             let opened = open_udp_flow(
                 flows,
                 key,
@@ -4803,7 +4867,7 @@ fn open_udp_flow<B>(
     flow_budget_state: &mut FlowBudgetState,
     udp_tasks: &mut JoinSet<()>,
     stack_tx: &mpsc::Sender<StackEvent>,
-    bridge: impl FnOnce(mpsc::Receiver<Bytes>) -> B,
+    bridge: impl FnOnce(UdpIngress) -> B,
 ) -> bool
 where
     B: std::future::Future<Output = ()> + Send + 'static,
@@ -4818,12 +4882,13 @@ where
         stack_tx.clone(),
         key,
         generation,
-        bridge(from_stack),
+        bridge(from_stack.into()),
     ));
     flows.insert(
         key,
         UdpFlow {
             to_remote,
+            queued: flow_budget_state.udp_queued_bytes_for_new_flow(),
             generation,
             last_used_sequence: generation,
             task: Some(task),
@@ -4833,9 +4898,10 @@ where
     true
 }
 
-/// Queues one datagram for an admitted flow. A full queue drops only this
-/// datagram and keeps the flow, as Xray's TUN packet queue does; a closed
-/// queue means the bridge task ended, so the flow is forgotten.
+/// Queues one datagram for an admitted flow. A full queue, by datagrams or
+/// by the profile's byte limits, drops only this datagram and keeps the flow,
+/// as Xray's TUN packet queue does; a closed queue means the bridge task
+/// ended, so the flow is forgotten.
 fn forward_udp_payload(
     flows: &mut HashMap<UdpFlowKey, UdpFlow>,
     key: UdpFlowKey,
@@ -4845,7 +4911,14 @@ fn forward_udp_payload(
     let Some(flow) = flows.get(&key) else {
         return;
     };
-    match flow.to_remote.try_send(payload) {
+    if !flow_budget_state.udp_queue_has_room(&flow.queued, payload.len()) {
+        flow_budget_state.record_udp_channel_drop();
+        return;
+    }
+    // The queue may hold the datagram for a while: give it its own
+    // allocation instead of a share of the TUN read buffer.
+    let datagram = QueuedDatagram::new(Bytes::copy_from_slice(&payload), Arc::clone(&flow.queued));
+    match flow.to_remote.try_send(datagram) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => flow_budget_state.record_udp_channel_drop(),
         Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -4902,7 +4975,7 @@ async fn bridge_udp_flow(
     provenance: FakeIpTargetProvenance,
     first_packet: Bytes,
     context: TunRuntimeContext,
-    mut from_stack: mpsc::Receiver<Bytes>,
+    mut from_stack: UdpIngress,
     mut shutdown: watch::Receiver<bool>,
     udp_timing_start: Option<StdInstant>,
 ) {
@@ -4990,6 +5063,7 @@ async fn bridge_udp_flow(
     let outbound = match selected.outbound {
         UdpSessionOutbound::Transport(outbound) => outbound,
         UdpSessionOutbound::Dns(outbound) => {
+            drop(first_packet);
             let Ok(dns_permit) = Arc::clone(&context.dns_udp_task_permits).try_acquire_owned()
             else {
                 return;
@@ -5020,6 +5094,7 @@ async fn bridge_udp_flow(
                 );
             }
             drop(first_payload);
+            drop(first_packet);
             blackhole::absorb_blackholed_udp_flow(
                 key, generation, blackhole, &context, from_stack, shutdown, connection,
             )
@@ -5053,6 +5128,9 @@ async fn bridge_udp_flow(
             }
         }
     }
+    // Only the rejection above answers the first packet; the flow may last
+    // for minutes.
+    drop(first_packet);
 
     match outbound {
         UdpOutbound::Freedom(freedom) => {
@@ -5207,7 +5285,7 @@ async fn bridge_udp_dns_outbound_flow(
 }
 
 async fn read_first_tun_udp_payload(
-    from_stack: &mut mpsc::Receiver<Bytes>,
+    from_stack: &mut UdpIngress,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Option<Bytes> {
     tokio::select! {
@@ -5273,7 +5351,7 @@ async fn sniff_tun_udp_target(
     target: &Target,
     provenance: FakeIpTargetProvenance,
     first_payload: &[u8],
-    from_stack: mpsc::Receiver<Bytes>,
+    from_stack: UdpIngress,
     shutdown: &mut watch::Receiver<bool>,
 ) -> (TunUdpSniffedTarget, UdpIngress) {
     let routes_by_protocol = context.outbound_router.sniffed_routing().protocol;
@@ -5285,7 +5363,7 @@ async fn sniff_tun_udp_target(
         .filter(|config| crate::sniffing::should_sniff_udp(Some(config), routes_by_protocol));
     let (sniffed, from_stack) = match config {
         Some(config) => sniff_udp_flow(config, target, first_payload, from_stack, shutdown).await,
-        None => (None, from_stack.into()),
+        None => (None, from_stack),
     };
     let mut sniffed = TunUdpSniffedTarget::from_sniffed(target, provenance, sniffed);
     sniffed.protocol =
@@ -5534,7 +5612,7 @@ async fn bridge_udp_freedom_flow_loop<T>(
 {
     let client = key.client.into_endpoint();
     let response_source = key.target.into_endpoint();
-    let mut read_buffer = vec![0; BRIDGE_READ_BUFFER_SIZE];
+    let mut masked_buffer = Vec::new();
     let first_payload_len = first_payload.len();
     let first_sent = tokio::select! {
         biased;
@@ -5578,11 +5656,12 @@ async fn bridge_udp_freedom_flow_loop<T>(
                 traffic.record_uplink(payload_len as u64);
                 timing.record_written(payload_len);
             }
-            received = socket.recv_from(&mut read_buffer) => {
-                let Ok((len, source)) = received else {
+            received = socket.recv_datagram::<BRIDGE_READ_BUFFER_SIZE>(&mut masked_buffer) => {
+                let Ok((payload, source)) = received else {
                     context.tun.record_udp_remote_read_error();
                     break;
                 };
+                let len = payload.len();
                 if final_rules::blocks(rules, xray_config::Network::Udp, source) {
                     continue;
                 }
@@ -5594,7 +5673,7 @@ async fn bridge_udp_freedom_flow_loop<T>(
                     .send(StackEvent::UdpDatagram {
                         client,
                         source: response_source,
-                        payload: Bytes::copy_from_slice(&read_buffer[..len]),
+                        payload,
                     })
                     .await
                     .is_err()
@@ -5960,6 +6039,34 @@ fn tcp_rx_buffer_size(mtu: usize) -> usize {
     TCP_BUFFER_SIZE.max(4 * mtu.saturating_sub(TCP_IPV4_HEADERS_LEN))
 }
 
+/// Receive buffer a TUN TCP socket starts with: two segments at least. The
+/// SYN fixes the window scale from the buffer's size, so a socket whose full
+/// buffer needs a scale starts with all of it.
+fn tcp_initial_rx_buffer_size(mtu: usize) -> usize {
+    let full = tcp_rx_buffer_size(mtu);
+    if full > usize::from(u16::MAX) {
+        return full;
+    }
+    TCP_INITIAL_RX_BUFFER_SIZE
+        .max(2 * mtu.saturating_sub(TCP_IPV4_HEADERS_LEN))
+        .min(full)
+}
+
+/// Gives a socket whose bridge reads the client's data its full receive
+/// buffer. The larger window goes out as a window update.
+fn grow_tcp_recv_buffer(socket: &mut tcp::Socket<'static>, size: usize) {
+    if socket.recv_capacity() < size {
+        socket.grow_recv_buffer(vec![0; size]);
+    }
+}
+
+/// Gives a socket its send buffer once the remote has data for it.
+fn grow_tcp_send_buffer(socket: &mut tcp::Socket<'static>) {
+    if socket.send_capacity() < TCP_BUFFER_SIZE {
+        socket.grow_send_buffer(vec![0; TCP_BUFFER_SIZE]);
+    }
+}
+
 fn tcp_listener_capacity_available(
     policy: TcpFlowBudgetPolicy,
     active_flow_count: usize,
@@ -5974,9 +6081,12 @@ fn add_tcp_listener(
     endpoint: IpEndpoint,
     mtu: usize,
 ) {
+    // A socket takes its full buffers only when it carries data: a SYN that
+    // is never completed, or a flow whose outbound does not connect, holds
+    // a few KiB instead of two buffers of 32 KiB.
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; tcp_rx_buffer_size(mtu)]),
-        tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
+        tcp::SocketBuffer::new(vec![0; tcp_initial_rx_buffer_size(mtu)]),
+        tcp::SocketBuffer::new(Vec::new()),
     );
     socket.set_nagle_enabled(false);
     // This socket terminates the host's local TUN link. Keep its existing
@@ -6731,9 +6841,21 @@ impl Device for PacketDevice {
         capabilities.medium = Medium::Ip;
         capabilities.max_transmission_unit = self.mtu;
         capabilities.max_burst_size = None;
-        capabilities.checksum = ChecksumCapabilities::default();
+        capabilities.checksum = packet_device_checksums();
         capabilities
     }
+}
+
+/// Checksums the TUN stack computes for what it sends and does not verify
+/// again for what it receives. Packets come from the host's own network
+/// stack, which computed them, through memory; `valid_tun_ip_packet` has
+/// checked the IPv4 header checksum before a packet reaches the stack, and
+/// verifying TCP's again would cost a pass over every uploaded byte.
+fn packet_device_checksums() -> ChecksumCapabilities {
+    let mut checksums = ChecksumCapabilities::default();
+    checksums.ipv4 = Checksum::Tx;
+    checksums.tcp = Checksum::Tx;
+    checksums
 }
 
 #[derive(Debug)]
@@ -7520,6 +7642,38 @@ mod tests {
     }
 
     #[test]
+    fn tun_tcp_stack_trusts_host_checksums_and_computes_its_own() {
+        let client_ip = Ipv4Addr::new(10, 10, 0, 2);
+        let server_ip = Ipv4Addr::new(203, 0, 113, 7);
+        let endpoint = IpEndpoint::new(IpAddress::Ipv4(server_ip), 443);
+        let mut device = PacketDevice::new(1500);
+        let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
+        iface_config.random_seed = DEFAULT_RANDOM_SEED;
+        let mut iface = Interface::new(iface_config, &mut device, Instant::now());
+        iface.set_any_ip(true);
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut listeners = HashMap::new();
+        add_tcp_listener(&mut sockets, &mut listeners, endpoint, 1500);
+
+        let mut syn =
+            build_ipv4_tcp_packet(client_ip, 49_152, server_ip, 443, 1_000, 0, TCP_SYN, &[]);
+        // Not the TCP checksum the SYN needs; the IPv4 header stays valid.
+        syn[36] ^= 0xff;
+        assert!(valid_tun_ip_packet(&syn));
+        device.push_inbound(Bytes::from(syn));
+        iface.poll(Instant::now(), &mut device, &mut sockets);
+
+        let syn_ack = device.pop_outbound().expect("the SYN is answered");
+        assert_eq!(internet_checksum(&syn_ack[..20]), 0, "IPv4 header checksum");
+        let tcp = ipv4_tcp_header_and_payload(&syn_ack).unwrap();
+        assert_eq!(
+            ipv4_tcp_checksum(server_ip, client_ip, tcp),
+            0,
+            "TCP checksum"
+        );
+    }
+
+    #[test]
     fn packet_device_transmits_outbound_packet() {
         let mut device = PacketDevice::new(1500);
 
@@ -7661,6 +7815,7 @@ mod tests {
             tcp: MOBILE_FLOW_BUDGET_POLICY.tcp,
             udp: UdpFlowBudgetPolicy {
                 max_active_flows: max_active_udp_flows,
+                ..MOBILE_FLOW_BUDGET_POLICY.udp
             },
         })
     }
@@ -7688,6 +7843,7 @@ mod tests {
             key,
             UdpFlow {
                 to_remote,
+                queued: Arc::new(QueuedBytes::new(Arc::default())),
                 generation: last_used_sequence,
                 last_used_sequence,
                 task: None,
@@ -7896,6 +8052,7 @@ mod tests {
             oldest_key,
             UdpFlow {
                 to_remote,
+                queued: Arc::new(QueuedBytes::new(Arc::default())),
                 generation: 1,
                 last_used_sequence: 1,
                 task: Some(task),
@@ -8227,6 +8384,50 @@ mod tests {
     }
 
     #[test]
+    fn every_profile_bounds_queued_udp_bytes() {
+        let mut last = None;
+        for profile in [
+            TunRuntimeProfile::LowMemory,
+            TunRuntimeProfile::Mobile,
+            TunRuntimeProfile::MobilePlus,
+            TunRuntimeProfile::Desktop,
+            TunRuntimeProfile::Throughput,
+        ] {
+            let udp = tun_runtime_policy_for_options(TunRuntimeOptions::with_profile(profile))
+                .flows
+                .udp;
+            // A flow can take up to a 64 KiB datagram, and a full queue of
+            // MTU-sized ones on desktop profiles.
+            assert!(udp.max_queued_bytes_per_flow >= 64 * 1024, "{profile:?}");
+            assert!(
+                udp.max_queued_bytes_per_flow < UDP_BRIDGE_CHANNEL_DEPTH * 64 * 1024,
+                "{profile:?}"
+            );
+            // The total binds well before every flow fills its queue.
+            assert!(
+                udp.max_queued_bytes_total < udp.max_active_flows * udp.max_queued_bytes_per_flow,
+                "{profile:?}"
+            );
+            if let Some((per_flow, total)) = last {
+                assert!(udp.max_queued_bytes_per_flow >= per_flow, "{profile:?}");
+                assert!(udp.max_queued_bytes_total >= total, "{profile:?}");
+            }
+            last = Some((udp.max_queued_bytes_per_flow, udp.max_queued_bytes_total));
+        }
+        // Inside the 50 MB an iOS Network Extension may use.
+        const {
+            assert!(MOBILE_TUN_RUNTIME_POLICY.flows.udp.max_queued_bytes_total <= 8 * 1024 * 1024);
+            assert!(
+                MOBILE_PLUS_TUN_RUNTIME_POLICY
+                    .flows
+                    .udp
+                    .max_queued_bytes_total
+                    <= 8 * 1024 * 1024
+            );
+        }
+    }
+
+    #[test]
     fn flow_upload_reservations_free_the_flow_before_the_shared_budget() {
         let mut budget = test_flow_budget(256);
         let pending = Arc::new(AtomicUsize::new(0));
@@ -8335,10 +8536,13 @@ mod tests {
         assert_eq!(writer.written.len(), 8 * 32 * 1024);
         assert_eq!(writer.writes, 4);
         assert_eq!(writer.flushes, 1);
+        // Chunks still wait, so the copy buffer is kept for them.
         let capacity = batch.capacity();
+        assert!(capacity > 0);
         assert!(capacity <= 2 * TCP_BRIDGE_COALESCE_BYTES);
 
-        // The next batch reuses the same buffer.
+        // The next batch reuses the same buffer, and releases it once
+        // nothing is left to coalesce.
         write_stack_batch_to_remote(
             &mut writer,
             &target,
@@ -8354,7 +8558,7 @@ mod tests {
         .await
         .unwrap();
         assert!(rx.is_empty());
-        assert_eq!(batch.capacity(), capacity);
+        assert_eq!(batch.capacity(), 0, "an idle flow keeps no copy buffer");
         assert_eq!(writer.written.len(), 13 * 32 * 1024);
     }
 

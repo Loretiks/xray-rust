@@ -67,6 +67,39 @@ long-term supported release series.
   outbound. Retransmissions, delayed ACKs, the 30-second linger, the
   four-minute give-up and UDP idle eviction keep their timing, and the
   statistics are still at most a second behind the last activity.
+- The TUN stack no longer verifies the checksums of the IPv4 headers and TCP
+  segments the host writes into it a second time: the host's network stack
+  computed them and hands the packets over in memory, and each IPv4 header
+  checksum is still checked once before a packet reaches smoltcp. This saves
+  a pass over every uploaded byte; a TCP segment with a wrong checksum is now
+  taken as it is. Packets the stack sends keep their computed checksums.
+- An idle TUN TCP flow holds about 80 KiB of heap instead of 146 KiB. Its
+  bridge kept a 64 KiB read buffer for the flow's whole life and copied every
+  read out of it; it now reads into a buffer on the stack and continues in a
+  heap chunk only when more is ready, which goes to the stack without the
+  copy. The smoltcp socket no longer takes its two 32 KiB buffers at the SYN:
+  it starts with an 8 KiB receive buffer (two segments at least) and no send
+  buffer, and grows them when the flow's bridge starts reading the client's
+  data and when the remote sends its first bytes, so SYNs that are never
+  completed and flows whose outbound is still connecting cost a few KiB each.
+  A grown receive window is announced at once. The vendored smoltcp gains
+  `Socket::grow_recv_buffer` and `Socket::grow_send_buffer` for this. The
+  upload side releases its coalescing buffer once nothing waits to be written,
+  and a freedom UDP flow no longer keeps a 16 KiB receive buffer.
+- A TUN UDP flow's queue to its outbound is bounded in bytes as well as in
+  datagrams: 64 KiB per flow and 2 MiB across flows on the `LowMemory` TUN
+  profile, 128 KiB and 4 MiB on `Mobile`, 256 KiB and 8 MiB on `MobilePlus`,
+  512 KiB and 64 MiB on `Desktop`, 1 MiB and 128 MiB on `Throughput`. A flow
+  could queue 256 datagrams, and every queued datagram was a slice of the
+  64 KiB buffer the TUN descriptor had been read into, so it kept that whole
+  buffer alive: a slow outbound let one flow hold up to 16 MiB, and a burst
+  over many flows enough to pass the 50 MB an iOS Network Extension may use.
+  A datagram over a limit is dropped, as one that finds its queue full, and
+  counted in `udp_channel_dropped_packets`; the flow stays up. Queued
+  datagrams now have allocations of their own, and so do the first packet a
+  UDP flow kept for an ICMP reply for as long as the flow lasted (it is now
+  released once the flow is routed), a DNS query the TUN answers itself, and
+  a datagram held while a TUN admission callback decides.
 - A Hysteria connect attempt to the last of the server's addresses, the only
   one for a server with one address, gets what is left of the dial's ten
   seconds, at most eight, where every attempt had three. Quinn's first probe
