@@ -1017,6 +1017,7 @@ pub(super) async fn bridge_udp_query(
         match response {
             Ok(response) => response,
             Err(()) => {
+                crate::crash_report::DNS_ANCHOR_FAILURES.note();
                 if context.runtime_logger.is_enabled() {
                     if let Some(target) =
                         target_from_endpoint_with_network(packet.target, RoutingNetwork::Udp)
@@ -3018,6 +3019,7 @@ async fn fail_finished_raw_dns_queries(
         let Some(query) = pending.remove(index) else {
             return RawDnsTcpIoResult::Failed;
         };
+        crate::crash_report::DNS_ANCHOR_FAILURES.note();
         let Some(response) = framed_dns_error_response(&query.payload, DNS_RCODE_SERVFAIL) else {
             return RawDnsTcpIoResult::Failed;
         };

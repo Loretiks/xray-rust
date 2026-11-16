@@ -33,6 +33,8 @@ fn ffi_header_declares_lifecycle_error_and_tun_abi() {
         "xray_ffi_version_minor",
         "xray_ffi_capabilities",
         "xray_profile_import_json",
+        "xray_set_crash_report_directory",
+        "xray_take_crash_reports",
         "xray_core_new",
         "xray_core_set_geodata_search_dir",
         "xray_core_set_geodata_search_dir_exclusive",
@@ -107,6 +109,7 @@ fn ffi_header_declares_lifecycle_error_and_tun_abi() {
     assert!(header.contains("XRAY_FFI_CAPABILITY_TUN_MTU = 1 << 29"));
     assert!(header.contains("XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT = 1 << 30"));
     assert!(header.contains("#define XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS 0x80000000ULL"));
+    assert!(header.contains("#define XRAY_FFI_CAPABILITY_CRASH_REPORTS 0x200000000ULL"));
     assert!(header.contains("uint64_t udp_oversize_datagrams;"));
     // The Rust enum, the JNI result carrier and the Swift mapping all rely on
     // these discriminants staying stable within ABI major 1.
@@ -219,6 +222,12 @@ fn apple_adapter_declares_packet_tunnel_pump() {
     assert!(core.contains("xray_core_set_tun_runtime_profile"));
     assert!(core.contains("xray_core_set_runtime_worker_threads"));
     assert!(core.contains("public static let runtimeWorkerThreads"));
+    assert!(core.contains("public static let crashReports"));
+    assert!(core.contains("xray_set_crash_report_directory("));
+    assert!(core.contains("xray_take_crash_reports("));
+    assert!(core.contains("public static func setCrashReportDirectory("));
+    assert!(core.contains("public static func takeCrashReports()"));
+    assert!(core.contains("public static func readCrashReport(at"));
     assert!(core.contains("xray_core_set_dns_bootstrap_mode"));
     assert!(core.contains("public static let outboundSelection"));
     assert!(core.contains("public static let outboundHealth"));
@@ -1290,6 +1299,8 @@ const EXPORTED_SYMBOLS: &[&str] = &[
     "xray_ffi_version_minor",
     "xray_ffi_capabilities",
     "xray_profile_import_json",
+    "xray_set_crash_report_directory",
+    "xray_take_crash_reports",
     "xray_core_new",
     "xray_core_set_geodata_search_dir",
     "xray_core_set_geodata_search_dir_exclusive",
@@ -1401,9 +1412,12 @@ static void use_xray_ffi_api(void) {
   capabilities &= XRAY_FFI_CAPABILITY_TUN_MTU;
   capabilities &= XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT;
   capabilities &= XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS;
+  capabilities &= XRAY_FFI_CAPABILITY_CRASH_REPORTS;
   capabilities &= XRAY_FFI_CAPABILITY_OUTBOUND_PROBE;
   (void)capabilities;
   (void)xray_profile_import_json(packet, sizeof(packet), NULL, 0, &written, &error);
+  (void)xray_set_crash_report_directory(NULL, &error);
+  (void)xray_take_crash_reports(message, sizeof(message), &message_written, &error);
   (void)xray_core_set_tun_mtu(handle, 1500, &error);
   (void)xray_core_set_runtime_worker_threads(handle, 2, &error);
   (void)xray_core_set_geodata_search_dir(handle, ".", &error);

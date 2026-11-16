@@ -119,10 +119,9 @@ impl PreConnections {
                     let opener = start();
                     let dialers = (0..self.dialers)
                         .map(|_| {
-                            tokio::spawn(dial(
-                                spec.clone(),
-                                Arc::clone(&queue),
-                                Arc::clone(&opener),
+                            tokio::spawn(crate::crash_report::catch_task_panic(
+                                "VLESS pre-connection dialer",
+                                dial(spec.clone(), Arc::clone(&queue), Arc::clone(&opener)),
                             ))
                         })
                         .collect();

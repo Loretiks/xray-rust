@@ -2,6 +2,8 @@ mod tun_admission;
 pub use tun_admission::*;
 mod profile_import;
 pub use profile_import::xray_profile_import_json;
+mod crash_report;
+pub use crash_report::{xray_set_crash_report_directory, xray_take_crash_reports};
 
 use bytes::Bytes;
 use libc::{c_char, c_int, c_void};
@@ -30,7 +32,7 @@ use xray_tun::TunTcpSlowFlowKind;
 use zeroize::Zeroize;
 
 pub const XRAY_FFI_ABI_MAJOR: u32 = 1;
-pub const XRAY_FFI_ABI_MINOR: u32 = 18;
+pub const XRAY_FFI_ABI_MINOR: u32 = 20;
 
 pub const XRAY_FFI_CAPABILITY_CONFIG_WARNINGS: u64 = 1 << 0;
 pub const XRAY_FFI_CAPABILITY_GEODATA_SEARCH: u64 = 1 << 1;
@@ -66,6 +68,8 @@ pub const XRAY_FFI_CAPABILITY_TUN_MTU: u64 = 1 << 29;
 pub const XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT: u64 = 1 << 30;
 /// ABI 1.18: `xray_core_set_runtime_worker_threads`.
 pub const XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS: u64 = 1 << 31;
+/// ABI 1.20: `xray_set_crash_report_directory` and `xray_take_crash_reports`.
+pub const XRAY_FFI_CAPABILITY_CRASH_REPORTS: u64 = 1 << 33;
 
 pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_CONFIG_WARNINGS
     | XRAY_FFI_CAPABILITY_GEODATA_SEARCH
@@ -98,7 +102,8 @@ pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_CONFIG_WARNINGS
     | XRAY_FFI_CAPABILITY_OUTBOUND_PROBE_CANCEL
     | XRAY_FFI_CAPABILITY_TUN_MTU
     | XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT
-    | XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS;
+    | XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS
+    | XRAY_FFI_CAPABILITY_CRASH_REPORTS;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +641,9 @@ unsafe fn xray_core_new_inner(error: *mut *mut XrayError) -> *mut XrayCoreHandle
     unsafe {
         clear_error(error);
     }
+    // Panics anywhere in the process are recorded from the first core on;
+    // `xray_take_crash_reports` returns them.
+    xray_core_rs::crash_report::install_panic_hook();
 
     let runtime_worker_threads = runtime_worker_threads(TunRuntimeProfile::Default);
     let runtime = match build_runtime(runtime_worker_threads) {

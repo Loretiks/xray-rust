@@ -434,7 +434,8 @@ impl MasqueOutbound {
             let result = outbound.establish(endpoint, &dialer, &base).await;
             pool.dialed(result)
         });
-        let lease = task.await.map_err(|_| {
+        let lease = task.await.map_err(|error| {
+            crate::crash_report::record_join_error("MASQUE tunnel dial", error);
             CoreError::from(MasqueError::Closed("the tunnel dial was cancelled".into()))
         })??;
         if *self.0.shutdown.borrow() {
@@ -575,7 +576,7 @@ impl MasqueOutbound {
             mut outgoing,
             incoming,
         } = packets;
-        let reader = tokio::spawn({
+        let reading = {
             let masque = Arc::clone(&masque);
             let stack = stack.clone();
             let incoming = incoming.clone();
@@ -587,8 +588,12 @@ impl MasqueOutbound {
                 }
                 stack.close();
             }
-        });
-        let writer = tokio::spawn({
+        };
+        let reader = tokio::spawn(crate::crash_report::catch_task_panic(
+            "MASQUE tunnel reader",
+            reading,
+        ));
+        let writing = {
             let masque = Arc::clone(&masque);
             let stack = stack.clone();
             async move {
@@ -605,7 +610,11 @@ impl MasqueOutbound {
                 masque.close();
                 stack.close();
             }
-        });
+        };
+        let writer = tokio::spawn(crate::crash_report::catch_task_panic(
+            "MASQUE tunnel writer",
+            writing,
+        ));
         let mut servers: Vec<IpAddr> = self
             .0
             .remote_dns
