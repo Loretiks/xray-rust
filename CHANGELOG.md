@@ -52,6 +52,20 @@ long-term supported release series.
   reference the same way.
 - Update async-compression to 0.4.52, with compression-codecs 0.4.47 and
   compression-core 0.4.34, and regex to 1.13.0.
+- Fake IP keeps a domain's address across a core restart. A host that
+  restarts the core to switch servers left apps holding fake IPs in their
+  caches and connection pools past the DNS TTL, and each new core began with
+  an empty table at a random pool address: such an address was dialled
+  literally as `198.19.x.y`, or handed to another domain, until the apps were
+  restarted. A domain's address is now the FNV-1a hash of its name within the
+  pool, probing up to 64 addresses forward past reserved ones and other
+  domains' live leases, so it is the same in every core and every process.
+  A stopping core also leaves its mappings, at most `poolSize`, for the next
+  core the process starts with the same `ipv4Pool` and `poolSize`, which
+  extends their running leases to a full `ttl`. At capacity a new domain
+  still fails closed until the earliest lease expires, and then takes its own
+  address when that is free rather than the expired one. The `tun-fake-dns`
+  benchmark expects the hash-derived address of `bench.example`.
 
 ## 0.10.0 - 2026-11-15
 
