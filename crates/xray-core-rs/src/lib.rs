@@ -29,6 +29,7 @@ mod dns;
 mod dns_outbound;
 mod dns_outbound_runtime;
 mod fake_dns;
+mod first_flows;
 mod health;
 mod http;
 mod http_forward;
@@ -545,6 +546,9 @@ pub struct Core {
     tun_admission: Option<TunAdmissionPolicy>,
     startup_probe: Option<StartupProbeOptions>,
     runtime_logger: RuntimeLogger,
+    /// The first TCP flows after the start or the latest network change,
+    /// whose timing the runtime log breaks down.
+    first_flows: Arc<first_flows::FirstFlows>,
 }
 
 struct CoreDnsDependencies {
@@ -942,6 +946,7 @@ impl Core {
             tun_admission: None,
             startup_probe: None,
             runtime_logger: RuntimeLogger::disabled(),
+            first_flows: Arc::default(),
         })
     }
 
@@ -1513,6 +1518,8 @@ impl Core {
             }
         }
         if has_tun_inbound {
+            // The first flows are timed from here, where the TUN starts.
+            self.first_flows.rearm(first_flows::FirstFlowCause::Start);
             let tun_inbound_tag = tun_inbounds.first().and_then(|(tag, _, _)| tag.clone());
             let tun_runtime_options = TunRuntimeOptions {
                 collect_tcp_timings: self.tun_runtime_options.collect_tcp_timings
@@ -1540,6 +1547,7 @@ impl Core {
                 tun_runtime_options,
                 self.tun_admission.clone(),
                 self.runtime_logger.clone(),
+                Arc::clone(&self.first_flows),
                 self.shutdown.subscribe(),
             )));
             if let Some(task) = runtime_stats_log::spawn_runtime_stats_logger(

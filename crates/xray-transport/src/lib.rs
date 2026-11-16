@@ -604,11 +604,79 @@ pub async fn connect_tcp_target(
     connect_tcp_stream(addr, socket_protector).await
 }
 
+/// How long a TCP connect may go unanswered before a second attempt starts
+/// on a fresh socket beside it.
+///
+/// A socket takes its route and source address when it connects, and its
+/// SYN retransmissions keep them. On a phone whose network was just set up
+/// (a VPN tunnel that came up a moment ago) or is changing (Wi-Fi to
+/// cellular), the route a socket took can lead nowhere: on iOS the first
+/// exchange after a tunnel start sometimes never reached the server, for up
+/// to the ten seconds a handshake may take, where a second attempt a moment
+/// later went through. A healthy path has answered the SYN and the kernel's
+/// first retransmission (one second on Darwin, Linux and Android) by now.
+pub const STALLED_CONNECT_RETRY: std::time::Duration = std::time::Duration::from_millis(1500);
+
 pub async fn connect_tcp_stream(
     addr: SocketAddr,
     socket_protector: Option<&dyn SocketProtector>,
 ) -> Result<TcpStream, TransportError> {
     let addr = canonicalize_socket_addr(addr);
+    // Boxed, so the futures of the many dials built on this one do not nest
+    // the race's state into their own.
+    let connect: Pin<Box<dyn std::future::Future<Output = _> + Send + '_>> =
+        Box::pin(retry_stalled_connect(STALLED_CONNECT_RETRY, move || {
+            connect_tcp_stream_once(addr, socket_protector)
+        }));
+    connect.await
+}
+
+/// Runs `attempt`, and once more beside it if it has not finished after
+/// `retry_after`: the first connection either attempt makes wins, and the
+/// other is dropped. When both fail, the first attempt's error is returned.
+async fn retry_stalled_connect<T, F, Fut>(
+    retry_after: std::time::Duration,
+    attempt: F,
+) -> Result<T, TransportError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
+    let first = attempt();
+    tokio::pin!(first);
+    tokio::select! {
+        result = &mut first => return result,
+        () = tokio::time::sleep(retry_after) => {}
+    }
+    let second = attempt();
+    tokio::pin!(second);
+    let mut first_failed = None;
+    let mut second_failed = false;
+    loop {
+        tokio::select! {
+            result = &mut first, if first_failed.is_none() => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) if second_failed => return Err(error),
+                Err(error) => first_failed = Some(error),
+            },
+            result = &mut second, if !second_failed => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => match first_failed.take() {
+                    Some(first_error) => return Err(first_error),
+                    None => {
+                        drop(error);
+                        second_failed = true;
+                    }
+                },
+            },
+        }
+    }
+}
+
+async fn connect_tcp_stream_once(
+    addr: SocketAddr,
+    socket_protector: Option<&dyn SocketProtector>,
+) -> Result<TcpStream, TransportError> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(protector) = socket_protector.filter(|protector| protector.multipath_tcp()) {
         // Go's `dialMPTCP` dials plain TCP after any Multipath TCP failure.
@@ -705,3 +773,132 @@ pub fn version() -> &'static str {
 mod udp_mask;
 pub use udp_mask::MaskedUdpSocket;
 pub mod udp_noise;
+
+#[cfg(test)]
+mod stalled_connect_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn refused(what: &str) -> TransportError {
+        TransportError::Tcp(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            what.to_owned(),
+        ))
+    }
+
+    /// The case of iOS right after a tunnel start: the first socket's SYNs
+    /// go nowhere, a socket opened a moment later connects at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_connect_is_retried_on_a_fresh_socket() {
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let connected = retry_stalled_connect(STALLED_CONNECT_RETRY, || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, TransportError>(attempt)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, 1, "the fresh socket's connection wins");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(started.elapsed(), STALLED_CONNECT_RETRY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_connect_opens_one_socket() {
+        let attempts = AtomicUsize::new(0);
+        let connected = retry_stalled_connect(STALLED_CONNECT_RETRY, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok::<_, TransportError>("first")
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, "first");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // A refusal is an answer too: no second socket.
+        let attempts = AtomicUsize::new(0);
+        let error = retry_stalled_connect(STALLED_CONNECT_RETRY, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), _>(refused("refused")) }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, TransportError::Tcp(_)), "{error:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// The first socket may still connect after the second started; the
+    /// first connection wins either way, and a failure of one waits for the
+    /// other.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_connection_of_either_attempt_wins() {
+        let attempts = AtomicUsize::new(0);
+        let connected = retry_stalled_connect(STALLED_CONNECT_RETRY, || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match attempt {
+                    0 => {
+                        tokio::time::sleep(STALLED_CONNECT_RETRY + Duration::from_millis(100))
+                            .await;
+                        Ok::<_, TransportError>("slow first")
+                    }
+                    _ => std::future::pending().await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, "slow first");
+
+        let attempts = AtomicUsize::new(0);
+        let connected = retry_stalled_connect(STALLED_CONNECT_RETRY, || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match attempt {
+                    0 => {
+                        tokio::time::sleep(STALLED_CONNECT_RETRY * 2).await;
+                        Err(refused("first"))
+                    }
+                    _ => {
+                        tokio::time::sleep(STALLED_CONNECT_RETRY * 3).await;
+                        Ok("second")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, "second");
+
+        let attempts = AtomicUsize::new(0);
+        let error = retry_stalled_connect(STALLED_CONNECT_RETRY, || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                tokio::time::sleep(STALLED_CONNECT_RETRY * 2).await;
+                Err::<(), _>(refused(if attempt == 0 { "first" } else { "second" }))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("first"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_loopback_connect_still_connects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        let stream = connect_tcp_stream(address, None).await.unwrap();
+        assert!(stream.nodelay().unwrap());
+        accept.await.unwrap().unwrap();
+    }
+}
