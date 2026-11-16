@@ -35,6 +35,38 @@ long-term supported release series.
   audits the upstream release under each vendored crate and every git
   dependency against RustSec, which `cargo audit` does not see.
 
+- The observatory skips the scheduled probe of a balancer's member while no
+  flow has been routed through the balancer since that member's last probe,
+  so a phone nobody uses no longer wakes its radio every `probeInterval`
+  (10 seconds by default). The first round probes every observed outbound;
+  the first flow through a balancer whose members were skipped has them
+  probed at once, and failure re-probes run as before. Observed outbounds
+  outside every balancer keep the interval. Selecting through a balancer
+  records its use: one atomic load per flow once the current round has seen
+  one.
+- The mobile, mobile-plus and low-memory TUN runtime profiles, and the
+  default profile on Android, iOS, tvOS and watchOS, run the FFI handle's
+  Tokio runtime on 2 worker threads, as the CLI does, where they ran on the
+  available parallelism up to 6. Measured with eight flows, 2 workers moved
+  72-74 Gbit/s for 330-360 ms of CPU and 6 workers 55-58 Gbit/s for 590-660
+  ms. The desktop and throughput profiles, and the default profile on other
+  targets, keep their count. ABI 1.18 adds
+  `xray_core_set_runtime_worker_threads` (`RUNTIME_WORKER_THREADS`, bit 31,
+  the first capability defined as a 64-bit macro since a C enum constant
+  cannot hold it) to set 1..=64 workers, or 0 for the profile's count, before
+  config load, and Swift `XrayCore` initializers take an optional
+  `runtimeWorkerThreads`. Selecting a profile or a count replaces the
+  handle's still idle runtime when the count changes.
+- The TUN loop no longer wakes every second. It slept at most a second for
+  its statistics, so an idle VPN, with no flows or only idle ones, woke the
+  process 45 to 50 times a minute where the same core without TUN woke none
+  (measured on macOS). It now sleeps until a packet, a flow event, smoltcp's
+  next timer or a housekeeping deadline: the close-wait sweep, the expiry of
+  a pooled DNS-over-TCP connection, and the TCP buffer statistics, recorded
+  a second after activity and every second while upload bytes wait for their
+  outbound. Retransmissions, delayed ACKs, the 30-second linger, the
+  four-minute give-up and UDP idle eviction keep their timing, and the
+  statistics are still at most a second behind the last activity.
 - A Hysteria connect attempt to the last of the server's addresses, the only
   one for a server with one address, gets what is left of the dial's ten
   seconds, at most eight, where every attempt had three. Quinn's first probe
