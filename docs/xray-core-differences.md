@@ -1439,6 +1439,14 @@ differences:
   three seconds for a place and is then refused, and an idle flow is never
   closed to make room ([flow limits](config-compatibility.md#wireguard-flow-limits)).
   Xray-core's gVisor stack sets no such bound.
+- A proxy outbound's `domainStrategy` (VLESS, VMess, Trojan, Shadowsocks,
+  SOCKS, HTTP, Hysteria) resolves its domain server through the bootstrap
+  resolver and dials the kept addresses in order, or races them under
+  `happyEyeballs`. Xray-core's `DialSystem` resolves through its DNS client
+  and dials one at random. Source-derived from `transport/internet/dialer.go`;
+  covered by a carrier unit test, not by interop. Beside `dialerProxy` or
+  `proxySettings` it fails parsing, where Xray-core hands the chain the
+  resolved address.
 - An option that fails is logged at debug level; Xray-core logs it at info,
   a level the runtime log here does not have.
 - Xray-core's outbound UDP sockets are IPv6 sockets that also carry IPv4, so
