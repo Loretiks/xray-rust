@@ -10,6 +10,15 @@ long-term supported release series.
 
 ## Unreleased
 
+- The observatory skips the scheduled probe of a balancer's member while no
+  flow has been routed through the balancer since that member's last probe,
+  so a phone nobody uses no longer wakes its radio every `probeInterval`
+  (10 seconds by default). The first round probes every observed outbound;
+  the first flow through a balancer whose members were skipped has them
+  probed at once, and failure re-probes run as before. Observed outbounds
+  outside every balancer keep the interval. Selecting through a balancer
+  records its use: one atomic load per flow once the current round has seen
+  one.
 - The mobile, mobile-plus and low-memory TUN runtime profiles, and the
   default profile on Android, iOS, tvOS and watchOS, run the FFI handle's
   Tokio runtime on 2 worker threads, as the CLI does, where they ran on the
