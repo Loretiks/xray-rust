@@ -298,6 +298,23 @@ long-term supported release series.
 Release candidate preparation; publication and exact-candidate release
 qualification are pending.
 
+- A TCP connect that has had no answer for 1.5 s opens a second socket to
+  the same address beside the first, and the first connection either makes
+  wins. On iOS the first exchange after a tunnel start was sometimes slow
+  (16 of 109 starts in the 0.10.0 device runs took 2 s or more), and in the
+  three that failed the core took the app's connection but its outbound
+  never reached the server, while the run's next attempt passed. The most
+  likely cause is the route the core's socket took: a socket keeps it for
+  all its SYN retransmissions, and one taken while the tunnel comes up, or
+  while the phone moves between Wi-Fi and cellular, can lead nowhere. This
+  is not proven on a device; the timing lines below are there to confirm it.
+  A connect that is answered, refused included, within 1.5 s opens one
+  socket as before.
+- With the runtime log on, the first eight TCP flows after a start each get
+  an `info` line that splits their time into `accepted` (the host's and the
+  system's part), `sniff`, `route`, `resolve`, `dial` and `firstByte`, so a
+  slow first exchange on a device shows where it waited. `RuntimeLogger`
+  gains an `info` level.
 - Security: the vendored quinn-proto moves from 0.11.16 to 0.11.19 and quinn
   from 0.11.9 to 0.11.12, keeping the local patches. 0.11.16 let a peer grow
   queues without bound with empty DATAGRAM frames (RUSTSEC-2026-0342) or

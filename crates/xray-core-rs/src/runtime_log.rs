@@ -80,6 +80,10 @@ impl RuntimeLogger {
         self.write_error("debug", message);
     }
 
+    pub fn info(&self, message: impl FnOnce() -> String) {
+        self.write_error("info", message);
+    }
+
     pub fn error(&self, message: impl FnOnce() -> String) {
         self.write_error("error", message);
     }

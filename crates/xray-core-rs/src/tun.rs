@@ -164,6 +164,10 @@ mod backpressure_tests;
 #[path = "tun_idle_tests.rs"]
 mod idle_tests;
 
+#[cfg(test)]
+#[path = "tun_first_flow_tests.rs"]
+mod first_flow_tests;
+
 #[path = "tun_download.rs"]
 mod download;
 use download::{
@@ -1075,6 +1079,7 @@ pub(crate) async fn serve_tun_endpoint(
     tun_runtime_options: TunRuntimeOptions,
     tun_admission: Option<TunAdmissionPolicy>,
     runtime_logger: RuntimeLogger,
+    first_flows: Arc<crate::first_flows::FirstFlows>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut device = PacketDevice::new(tun.mtu());
@@ -1141,6 +1146,7 @@ pub(crate) async fn serve_tun_endpoint(
         dns_udp_task_permits,
         dns_mode,
         runtime_logger,
+        first_flows,
     };
     let mut housekeeping = TunHousekeeping::new(TokioInstant::now());
     let mut next_smoltcp_deadline = None;
@@ -1745,6 +1751,7 @@ struct TunRuntimeContext {
     dns_udp_task_permits: Arc<Semaphore>,
     dns_mode: TunDnsMode,
     runtime_logger: RuntimeLogger,
+    first_flows: Arc<crate::first_flows::FirstFlows>,
 }
 
 fn dns_udp_task_limit(global_udp_task_limit: usize) -> usize {
@@ -3172,6 +3179,19 @@ async fn open_tcp_bridge_stream(
     context: &TunRuntimeContext,
     source: Option<InboundSource>,
 ) -> Result<BoxedTransportStream, crate::CoreError> {
+    open_timed_tcp_bridge_stream(outbound, target, dns_upstream, context, source, None).await
+}
+
+/// [`open_tcp_bridge_stream`], counting the lookups of the outbound's open
+/// toward `first_flow`.
+async fn open_timed_tcp_bridge_stream(
+    outbound: &TcpOutbound,
+    target: &Target,
+    dns_upstream: Option<&dns_proxy::DnsProxyUpstream>,
+    context: &TunRuntimeContext,
+    source: Option<InboundSource>,
+    first_flow: Option<&crate::first_flows::FirstFlowTiming>,
+) -> Result<BoxedTransportStream, crate::CoreError> {
     if let Some(upstream) = dns_upstream {
         if matches!(
             upstream.transport(),
@@ -3266,6 +3286,17 @@ async fn open_tcp_bridge_stream(
         TcpOutbound::Wireguard(_) => context.dns_resolver.as_ref(),
         TcpOutbound::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
     };
+    if let Some(first_flow) = first_flow {
+        return open_tcp_stream_with_resolvers_and_dialer(
+            outbound,
+            target,
+            &first_flow.timed(destination_resolver),
+            &first_flow.timed(context.bootstrap_dns_resolver()),
+            &context.transport_dialer,
+            source.as_ref(),
+        )
+        .await;
+    }
     open_tcp_stream_with_resolvers_and_dialer(
         outbound,
         target,
@@ -3299,6 +3330,13 @@ async fn bridge_tcp_flow(
     let mut initial_upload = VecDeque::new();
     let mut protocol = None;
     let mut attributes = None;
+    // The first flows after a start or a network change are timed for the
+    // runtime log.
+    let mut first_flow = context
+        .runtime_logger
+        .is_enabled()
+        .then(|| context.first_flows.claim().map(Box::new))
+        .flatten();
     if let TcpBridgeDestination::Standard(restored) = &destination {
         let provenance = restored.provenance;
         let sniffed_routing = context.outbound_router.sniffed_routing();
@@ -3319,15 +3357,19 @@ async fn bridge_tcp_flow(
                 return;
             }
             client_already_opened = true;
-            let Some((upload, sniffed)) = read_tun_tcp_sniff_payload(
+            let sniff_started = StdInstant::now();
+            let sniffed = read_tun_tcp_sniff_payload(
                 &mut from_stack,
                 &mut shutdown,
                 sniffing_config,
                 &restored.target,
                 sniffed_routing.attributes,
             )
-            .await
-            else {
+            .await;
+            if let Some(first_flow) = first_flow.as_mut() {
+                first_flow.sniffed(sniff_started.elapsed());
+            }
+            let Some((upload, sniffed)) = sniffed else {
                 let mut close_guard =
                     TcpBridgeCloseGuard::new(handle, generation, context.stack_tx.clone());
                 close_guard.close().await;
@@ -3364,6 +3406,7 @@ async fn bridge_tcp_flow(
             attributes: attributes.as_ref(),
             ..context.app_route(client)
         };
+        let route_started = StdInstant::now();
         let selected_dns_outbound = tokio::select! {
             biased;
             () = wait_for_tun_shutdown(&mut shutdown) => return,
@@ -3375,6 +3418,9 @@ async fn bridge_tcp_flow(
                     context.dns_resolver.as_ref(),
                 ) => result,
         };
+        if let Some(first_flow) = first_flow.as_mut() {
+            first_flow.routed(route_started.elapsed());
+        }
         match selected_dns_outbound {
             Ok(Some(outbound)) => {
                 let TcpBridgePermits {
@@ -3449,6 +3495,7 @@ async fn bridge_tcp_flow(
         client.map(InboundSource::tcp),
         protocol,
         attributes,
+        first_flow,
     )
     .await;
 }
@@ -3573,6 +3620,7 @@ async fn bridge_preopened_dns_tcp_flow(
         None,
         None,
         None,
+        None,
     )
     .await;
 }
@@ -3599,6 +3647,7 @@ async fn bridge_tcp_flow_inner(
     source: Option<InboundSource>,
     protocol: Option<crate::sniffing::SniffedProtocol>,
     attributes: Option<xray_config::ContentAttributes>,
+    mut first_flow: Option<Box<crate::first_flows::FirstFlowTiming>>,
 ) {
     let collect_tcp_timings = context.tun_runtime_options.collect_tcp_timings;
     let tcp_timing_start = collect_tcp_timings.then(StdInstant::now);
@@ -3645,6 +3694,7 @@ async fn bridge_tcp_flow_inner(
             last_failure = Some(("DNS TCP proxy deadline elapsed".to_owned(), None));
             break;
         }
+        let route_started = StdInstant::now();
         let outbound_result = if dns_upstream
             .as_ref()
             .is_some_and(dns_proxy::DnsProxyUpstream::is_local)
@@ -3701,6 +3751,9 @@ async fn bridge_tcp_flow_inner(
                 } => result,
             }
         };
+        if let Some(first_flow) = first_flow.as_mut() {
+            first_flow.routed(route_started.elapsed());
+        }
         let (outbound, outbound_tag, outbound_node) = match outbound_result {
             Ok((TcpSessionOutbound::Transport(outbound), tag, node)) => (outbound, tag, node),
             Ok((TcpSessionOutbound::Blackhole(blackhole), outbound_tag, _)) => {
@@ -3792,21 +3845,26 @@ async fn bridge_tcp_flow_inner(
             }
             None => policy_timeout,
         };
+        let open_started = StdInstant::now();
         let open_result = tokio::select! {
             biased;
             () = wait_for_tun_shutdown(&mut shutdown) => return,
             () = wait_for_connection_close(&mut connection_close) => return,
             result = tokio::time::timeout(
                 open_timeout,
-                open_tcp_bridge_stream(
+                open_timed_tcp_bridge_stream(
                     &outbound,
                     &dial_target,
                     dns_upstream.as_ref(),
                     &context,
                     source,
+                    first_flow.as_deref(),
                 ),
             ) => result,
         };
+        if let Some(first_flow) = first_flow.as_mut() {
+            first_flow.opened(open_started.elapsed());
+        }
         match open_result {
             Ok(Ok(stream)) => {
                 opened = Some((
@@ -3855,6 +3913,14 @@ async fn bridge_tcp_flow_inner(
     else {
         let (error, outbound_tag) = last_failure
             .unwrap_or_else(|| ("no usable DNS TCP upstream configured".to_owned(), None));
+        if let Some(first_flow) = first_flow.take() {
+            (*first_flow).report(
+                &context.runtime_logger,
+                &client_target,
+                outbound_tag.as_deref().unwrap_or("untagged"),
+                crate::first_flows::FirstFlowOutcome::OpenFailed(&error),
+            );
+        }
         if context.runtime_logger.is_enabled() {
             let outbound_log_label = if outbound_tag.is_some() {
                 "<configured>"
@@ -4007,6 +4073,16 @@ async fn bridge_tcp_flow_inner(
             open_duration_ms,
             outbound_tag.clone(),
         );
+        if let Some(first_flow) = first_flow.take() {
+            timing.first_flow = Some(Box::new(FirstFlowReport {
+                timing: Some(*first_flow),
+                logger: context.runtime_logger.clone(),
+                target: client_target.clone(),
+                outbound: outbound_tag
+                    .clone()
+                    .unwrap_or_else(|| crate::debug_log::tcp_outbound_label(&outbound).to_owned()),
+            }));
+        }
         termination = bridge_tcp_flow_loop(
             handle,
             generation,
@@ -4435,10 +4511,35 @@ impl TcpFirstByteTiming for TcpFirstByteTimingDisabled {
     fn record_flow_summary(&mut self, _tun: &TunEndpoint, _target: &Target, _closed: bool) {}
 }
 
+/// The runtime log's line for one of the first flows after a start or a
+/// network change: at its first byte back, or as it ends without one.
+struct FirstFlowReport {
+    timing: Option<crate::first_flows::FirstFlowTiming>,
+    logger: RuntimeLogger,
+    target: Target,
+    outbound: String,
+}
+
+impl FirstFlowReport {
+    fn report(&mut self, outcome: crate::first_flows::FirstFlowOutcome<'_>) {
+        if let Some(timing) = self.timing.take() {
+            timing.report(&self.logger, &self.target, &self.outbound, outcome);
+        }
+    }
+}
+
+impl Drop for FirstFlowReport {
+    fn drop(&mut self) {
+        self.report(crate::first_flows::FirstFlowOutcome::ClosedWithoutResponse);
+    }
+}
+
 struct TcpFirstByteTimingEnabled {
     start: StdInstant,
     is_tcp443: bool,
     outbound_tag: Option<String>,
+    /// Boxed: only the first flows after a start have one.
+    first_flow: Option<Box<FirstFlowReport>>,
     open_duration_ms: u64,
     first_byte_duration_ms: u64,
     remote_read_bytes: u64,
@@ -4463,6 +4564,7 @@ impl TcpFirstByteTimingEnabled {
             start,
             is_tcp443,
             outbound_tag,
+            first_flow: None,
             open_duration_ms,
             first_byte_duration_ms: 0,
             remote_read_bytes: 0,
@@ -4483,6 +4585,9 @@ impl TcpFirstByteTiming for TcpFirstByteTimingEnabled {
     fn record_first_byte(&mut self, tun: &TunEndpoint, target: &Target) {
         if self.recorded {
             return;
+        }
+        if let Some(first_flow) = self.first_flow.as_mut() {
+            first_flow.report(crate::first_flows::FirstFlowOutcome::FirstByte);
         }
         let first_byte_duration_ms = elapsed_ms_since(&self.start);
         self.first_byte_duration_ms = first_byte_duration_ms;
