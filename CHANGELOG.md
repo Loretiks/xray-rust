@@ -10,6 +10,18 @@ long-term supported release series.
 
 ## Unreleased
 
+- Full Xray JSON subscriptions with fields Xray-core accepts and that change
+  nothing here now start, with a warning for each, where they failed to
+  parse: root `stats`, `api`, `metrics`, `version` and `geodata` objects,
+  `routing.domainMatcher`, `sockopt.tcpNoDelay`, mKCP `congestion`,
+  `readBufferSize` and `writeBufferSize`, and TLS `minVersion`, `maxVersion`,
+  `cipherSuites`, `curvePreferences`, `useSystemCA` and `show`. A uTLS
+  fingerprint decides the TLS four, as in Xray-core. `echConfigList` is
+  accepted without ECH, so the server name goes out in the clear, as its
+  warning says. `disableSystemRoot: true` is accepted only beside
+  `pinnedPeerCertSha256` and still fails without one, since ignoring it would
+  trust roots the config turned off. Values Go's decoding refuses, and
+  unknown keys, still fail.
 - A Hysteria connect attempt to the last of the server's addresses, the only
   one for a server with one address, gets what is left of the dial's ten
   seconds, at most eight, where every attempt had three. Quinn's first probe
