@@ -1980,6 +1980,37 @@ async fn c_max_reuse_times_retires_a_client_after_exactly_two_selections() {
     }
 }
 
+/// After a network change the pooled HTTP/2 connection is dropped and the
+/// next stream dials a new one, which the transport then pools as before.
+#[tokio::test]
+async fn a_reset_pool_dials_again_and_pools_the_new_connection() {
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = success_h2_dial(Arc::clone(&dials));
+    let transport = transport(
+        XhttpModeSelection::StreamOne,
+        XhttpHttpVersion::Http2,
+        unlimited_xmux(),
+        4,
+    );
+    let first = transport
+        .open_stream_with_dial(Arc::clone(&dial))
+        .await
+        .unwrap();
+    drop(first);
+    assert_eq!(dials.load(Ordering::Acquire), 1);
+
+    assert_eq!(transport.reset_pool().await, 1);
+    assert_eq!(transport.reset_pool().await, 0, "nothing is left to drop");
+    for expected in [2, 2] {
+        let stream = transport
+            .open_stream_with_dial(Arc::clone(&dial))
+            .await
+            .unwrap();
+        drop(stream);
+        assert_eq!(dials.load(Ordering::Acquire), expected);
+    }
+}
+
 #[tokio::test]
 async fn h_max_request_times_rotates_packet_uploader_after_downlink_budget() {
     let dials = Arc::new(AtomicUsize::new(0));

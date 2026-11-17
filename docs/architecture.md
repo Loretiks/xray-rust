@@ -492,6 +492,17 @@ Lifecycle/configuration operations are serialized by the host adapters.
 Documented data-path calls may run concurrently, but never concurrently with
 load/start/stop/set/free operations. See [the C ABI contract](ffi.md).
 
+A network change is a shared call (`Core::network_changed`), not a restart.
+The factory's per-leaf caches stay; each pool forgets what it holds: a Mux
+pool closes its parents and bumps a reset counter its cold connects watch,
+a `testpre` pool goes back to idle, gRPC, XHTTP and HTTP/2 pools drop their
+pooled connections while open streams keep their own handles, and the
+resolver caches drop their answers. Stopping the core is what closes the
+pools for good (`close_sessions`). The connection a change warms is a
+background task with a timeout whose abort handle the core keeps: the next
+change or a stop aborts it, and what it opens waits in the outbound's
+carrier, for a stream to the same server, no longer than 2.5 s.
+
 ## Platform boundary
 
 - Apple builds `xray-ffi` as static-library XCFramework slices and exposes

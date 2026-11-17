@@ -134,6 +134,64 @@ fn ffi_hysteria_rebind_validates_outputs_and_keeps_idle_outbounds_lazy() {
     }
 }
 
+/// ABI 1.19: a network change on a null, unloaded, loaded, running and
+/// stopped handle. Its effects are covered in the core's own tests.
+#[test]
+fn ffi_network_change_needs_a_loaded_core_and_runs_on_every_state() {
+    use xray_ffi::{
+        xray_core_network_changed, xray_core_start, xray_core_stop,
+        XRAY_FFI_CAPABILITY_NETWORK_CHANGE,
+    };
+    assert_ne!(
+        xray_ffi_capabilities() & XRAY_FFI_CAPABILITY_NETWORK_CHANGE,
+        0
+    );
+    assert!(xray_ffi_version_minor() >= 19);
+    unsafe {
+        let mut error = std::ptr::null_mut();
+        assert_eq!(
+            xray_core_network_changed(std::ptr::null_mut(), &mut error),
+            XrayStatus::NullArgument
+        );
+        xray_error_free(error);
+        error = std::ptr::null_mut();
+        let handle = xray_core_new(&mut error);
+        assert_eq!(
+            xray_core_network_changed(handle, &mut error),
+            XrayStatus::CoreNotLoaded
+        );
+        xray_error_free(error);
+        error = std::ptr::null_mut();
+        let config = CString::new(
+            r#"{"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":0}],
+                "outbounds":[{"protocol":"freedom"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            xray_core_load_config_json(handle, config.as_ptr(), &mut error),
+            XrayStatus::Ok
+        );
+        assert_eq!(
+            xray_core_network_changed(handle, &mut error),
+            XrayStatus::Ok
+        );
+        assert_eq!(xray_core_start(handle, &mut error), XrayStatus::Ok);
+        for _ in 0..2 {
+            assert_eq!(
+                xray_core_network_changed(handle, &mut error),
+                XrayStatus::Ok
+            );
+        }
+        assert_eq!(xray_core_stop(handle, &mut error), XrayStatus::Ok);
+        assert_eq!(
+            xray_core_network_changed(handle, &mut error),
+            XrayStatus::Ok
+        );
+        assert!(error.is_null());
+        xray_core_free(handle);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProbeOutputs {
     delay_ms: u64,
@@ -737,7 +795,8 @@ fn ffi_reports_exact_current_capabilities() {
         | xray_ffi::XRAY_FFI_CAPABILITY_OUTBOUND_PROBE_CANCEL
         | xray_ffi::XRAY_FFI_CAPABILITY_TUN_MTU
         | xray_ffi::XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT
-        | xray_ffi::XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS;
+        | xray_ffi::XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS
+        | xray_ffi::XRAY_FFI_CAPABILITY_NETWORK_CHANGE;
 
     assert_eq!(XRAY_FFI_CAPABILITIES, expected);
     assert_eq!(xray_ffi_capabilities(), expected);

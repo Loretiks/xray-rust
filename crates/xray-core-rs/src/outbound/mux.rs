@@ -36,6 +36,12 @@ fn closed() -> io::Error {
 fn full() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "Mux session capacity exhausted")
 }
+fn reset() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "Mux session reset by a network change",
+    )
+}
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -114,6 +120,11 @@ impl Runtime {
             p.close();
         }
     }
+    /// Closes the parents of both pools, which stay open for new children:
+    /// see [`Pool::reset`]. Returns how many parents were closed.
+    pub(super) fn reset(&self) -> u64 {
+        self.tcp.as_ref().map_or(0, Pool::reset) + self.udp.as_ref().map_or(0, Pool::reset)
+    }
     pub(super) async fn join(&self) {
         if let Some(p) = &self.tcp {
             p.join().await;
@@ -139,6 +150,8 @@ pub(super) struct Pool {
     connecting: AsyncMutex<()>,
     closed: std::sync::atomic::AtomicBool,
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// Counts [`Self::reset`]s: a cold connect in flight gives up on one.
+    resets: tokio::sync::watch::Sender<u64>,
 }
 impl Pool {
     pub(super) fn new(concurrency: u16) -> Self {
@@ -149,6 +162,7 @@ impl Pool {
             connecting: AsyncMutex::new(()),
             closed: std::sync::atomic::AtomicBool::new(false),
             shutdown: tokio::sync::watch::channel(false).0,
+            resets: tokio::sync::watch::channel(0).0,
         }
     }
     pub(super) async fn open<F>(&self, target: &Target, connect: F) -> Result<Child, CoreError>
@@ -176,6 +190,7 @@ impl Pool {
             payload: None,
         })?;
         let mut shutdown = self.shutdown.subscribe();
+        let mut resets = self.resets.subscribe();
         if self.closed.load(Ordering::Acquire) {
             return Err(closed().into());
         }
@@ -224,8 +239,13 @@ impl Pool {
         for parent in retired {
             parent.join().await;
         }
-        let stream =
-            tokio::select! {_ = shutdown.changed()=>return Err(closed().into()),r=connect=>r?};
+        // A connect begun on the network a reset left would not be one the
+        // pool keeps.
+        let stream = tokio::select! {
+            _ = shutdown.changed() => return Err(closed().into()),
+            _ = resets.changed() => return Err(reset().into()),
+            r = connect => r?,
+        };
         let parent = Parent::new(stream);
         let child = parent.allocate(target, self.concurrency, global_id);
         let admitted = {
@@ -255,6 +275,28 @@ impl Pool {
         for parent in lock(&self.parents).iter() {
             parent.close();
         }
+    }
+    /// Closes every parent, failing its children, and the cold connect in
+    /// flight, after a network change: a parent's connection went over the
+    /// network the device left, and a child cannot move to another parent.
+    /// The pool itself stays open: the next child dials a new parent. The
+    /// closed parents stay listed until that dial retires them, so
+    /// [`Self::join`] still waits for their tasks. Returns how many parents
+    /// were open.
+    pub(super) fn reset(&self) -> u64 {
+        if self.closed.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.resets
+            .send_modify(|resets| *resets = resets.wrapping_add(1));
+        let mut open = 0;
+        for parent in lock(&self.parents).iter() {
+            if !lock(&parent.shared.state).closed {
+                open += 1;
+            }
+            parent.close();
+        }
+        open
     }
     pub(super) async fn join(&self) {
         let parents = std::mem::take(&mut *lock(&self.parents));
@@ -1028,6 +1070,81 @@ mod tests {
     /// One poll of a flush, as [`poll_write_once`].
     async fn poll_flush_once(child: &mut Child) -> Poll<io::Result<()>> {
         std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *child).poll_flush(cx))).await
+    }
+
+    /// After a network change the pool's parents are closed with their
+    /// children, and the next child dials a new parent, as the pool stays
+    /// open: unlike [`Pool::close`], which ends it for good.
+    #[tokio::test]
+    async fn a_reset_pool_closes_its_parents_and_dials_new_ones() {
+        timeout(Duration::from_secs(10), async {
+            let pool = Pool::new(2);
+            let target = destination(RoutingNetwork::Tcp);
+            let (stream, _old_peer) = pair();
+            let mut before = pool.open(&target, async { Ok(stream) }).await.unwrap();
+            before.flush().await.unwrap();
+            let old_parent = before.token.parent.clone();
+
+            assert_eq!(pool.reset(), 1);
+            assert!(lock(&old_parent.shared.state).closed);
+            assert!(matches!(
+                poll_write_once(&mut before, b"late").await,
+                Poll::Ready(Err(_))
+            ));
+            assert_eq!(pool.reset(), 0, "nothing is left open to reset");
+
+            let (stream, mut new_peer) = pair();
+            let mut after = pool.open(&target, async { Ok(stream) }).await.unwrap();
+            assert!(!Arc::ptr_eq(&after.token.parent, &old_parent));
+            after.write_all(b"fresh").await.unwrap();
+            after.flush().await.unwrap();
+            let mut frame = [0; 64];
+            let read = new_peer.read(&mut frame).await.unwrap();
+            assert!(read > 0, "the new parent carries the child");
+            // The closed parent was retired by the new dial.
+            assert_eq!(lock(&pool.parents).len(), 1);
+            pool.close();
+            assert_eq!(pool.reset(), 0, "a closed pool is not reopened");
+            pool.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A cold connect under way when the network changes is abandoned
+    /// rather than becoming a parent over the old network; the dial after
+    /// it proceeds.
+    #[tokio::test]
+    async fn a_reset_abandons_the_cold_connect_in_flight() {
+        timeout(Duration::from_secs(10), async {
+            let pool = Arc::new(Pool::new(2));
+            let target = destination(RoutingNetwork::Tcp);
+            let (connect_started, started) = tokio::sync::oneshot::channel();
+            let opening = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                let target = target.clone();
+                async move {
+                    pool.open(&target, async move {
+                        let _ = connect_started.send(());
+                        std::future::pending().await
+                    })
+                    .await
+                }
+            });
+            started.await.unwrap();
+            pool.reset();
+            let abandoned = opening.await.unwrap();
+            assert!(
+                matches!(&abandoned, Err(CoreError::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted),
+                "{abandoned:?}"
+            );
+            let (stream, _peer) = pair();
+            pool.open(&target, async { Ok(stream) }).await.unwrap();
+            pool.close();
+            pool.join().await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

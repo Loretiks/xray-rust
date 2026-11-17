@@ -173,6 +173,10 @@ public struct XrayFFICapabilities: OptionSet, Equatable, Sendable {
     public static let runtimeWorkerThreads = Self(
         rawValue: UInt64(XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS)
     )
+    /// Bit 32 (ABI 1.19): `XrayCore.networkChanged()`.
+    public static let networkChange = Self(
+        rawValue: UInt64(XRAY_FFI_CAPABILITY_NETWORK_CHANGE)
+    )
 }
 
 /// MTU of the host's TUN interface (ABI 1.16). Give the interface and the core
@@ -1410,6 +1414,32 @@ public final class XrayCore: @unchecked Sendable {
             var accepted: UInt64 = 0
             try check(xray_core_rebind_hysteria(handle, &accepted, &error), error: error)
             return accepted
+        }
+    }
+
+    /// Recovers the core from an OS network change (Wi-Fi to cellular and
+    /// back, a network that came back) without a restart, which would lose
+    /// the fake-IP mappings apps hold. Retires pooled carrier sessions
+    /// (Mux.Cool and XUDP parents, `testpre` connections, gRPC, XHTTP and
+    /// HTTP/2 pools) while the outbounds stay open; moves Hysteria, WireGuard
+    /// and the other QUIC carriers to fresh sockets, as `rebindHysteria()` and
+    /// `rebindWireGuard()` do; drops cached DNS answers and failures; and on a
+    /// running core warms one connection to the current proxy in the
+    /// background (at most 5 s, held 2.5 s for the next flow). Returns once
+    /// the resets are done; the next call or `stop()` cancels the warm-up.
+    /// Open flows stay up: close them with `closeConnection(id:)` if they
+    /// should reconnect over the new network. Thread-safe alongside the data
+    /// path; waits only behind a concurrent lifecycle call. Requires ABI 1.19
+    /// and `XrayFFICapabilities.networkChange`.
+    public func networkChanged() throws {
+        let version = Self.ffiInfo.version
+        guard version.minor >= 19 else {
+            throw XrayCoreError.incompatibleFFIMinorVersion(required: 19, actual: version.minor)
+        }
+        try requireCapability(.networkChange)
+        try withSharedHandle { handle in
+            var error: OpaquePointer?
+            try check(xray_core_network_changed(handle, &error), error: error)
         }
     }
 

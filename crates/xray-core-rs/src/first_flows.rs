@@ -5,11 +5,12 @@
 //! 0.10.0 owner decision `ios-slow-first-exchange`: 16 of 109 starts took 2 s
 //! or more, and the failed attempts never reached the server). The core's
 //! existing statistics only say how long an open took. For the first
-//! [`FIRST_FLOWS_REPORTED`] TCP flows after a start the runtime log gets one
-//! `info` line per flow that splits it up:
+//! [`FIRST_FLOWS_REPORTED`] TCP flows after a start, and again after each
+//! [`crate::Core::network_changed`], the runtime log gets one `info` line per
+//! flow that splits it up:
 //!
-//! - `accepted`: from the start to the flow reaching the core, which is the
-//!   host's and the system's part;
+//! - `accepted`: from the start (or the change) to the flow reaching the
+//!   core, which is the host's and the system's part;
 //! - `sniff`: waiting for the client's first bytes, when sniffing;
 //! - `route`: choosing the outbound, with any lookup routing makes;
 //! - `resolve`: looking the server up while opening the outbound;
@@ -41,12 +42,14 @@ pub(crate) const FIRST_FLOWS_REPORTED: u32 = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FirstFlowCause {
     Start,
+    NetworkChange,
 }
 
 impl FirstFlowCause {
     fn label(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::NetworkChange => "network change",
         }
     }
 }
@@ -273,10 +276,10 @@ mod tests {
         );
         assert!(flows.claim().is_none());
 
-        flows.rearm(FirstFlowCause::Start);
-        let after_restart = flows.claim().expect("a start rearms the reports");
-        assert_eq!(after_restart.ordinal, 1);
-        assert_eq!(after_restart.cause, FirstFlowCause::Start);
+        flows.rearm(FirstFlowCause::NetworkChange);
+        let after_change = flows.claim().expect("a network change rearms the reports");
+        assert_eq!(after_change.ordinal, 1);
+        assert_eq!(after_change.cause, FirstFlowCause::NetworkChange);
     }
 
     #[test]

@@ -4854,6 +4854,37 @@ mod stream_grpc_pool_tests {
         assert_eq!(peer.accepted(), 2, "the idle connection was replaced");
     }
 
+    /// After a network change the pool forgets its connection, and the next
+    /// flow dials a new one; the call already open on the old connection
+    /// keeps working, and the transport stays usable.
+    #[tokio::test]
+    async fn a_reset_pool_dials_a_new_connection_and_keeps_open_calls() {
+        let peer = GrpcPeer::spawn(AfterFirstCall::KeepServing).await;
+        let dialer = dialer();
+        let transport = TransportLayer::Grpc(GrpcTransport::new(config()));
+        let TransportLayer::Grpc(grpc) = &transport else {
+            panic!("the transport under test is gRPC");
+        };
+
+        within_deadline(async {
+            let mut open_call = open_flow(&dialer, &transport, peer.addr).await;
+            round_trip(&mut open_call, b"before").await;
+            assert_eq!(peer.accepted(), 1);
+
+            assert_eq!(grpc.reset_pool().await, 1);
+            assert!(!grpc.holds_a_live_connection().await);
+            assert_eq!(grpc.reset_pool().await, 0, "nothing is left to forget");
+
+            let mut after = open_flow(&dialer, &transport, peer.addr).await;
+            round_trip(&mut after, b"after").await;
+            assert_eq!(peer.accepted(), 2, "the next flow dialed a new connection");
+            round_trip(&mut open_call, b"still open").await;
+            end_flow(after).await;
+            end_flow(open_call).await;
+        })
+        .await;
+    }
+
     /// Two calls at once on the pooled connection, neither reading the other's
     /// bytes.
     #[tokio::test]

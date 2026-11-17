@@ -556,6 +556,33 @@ pub struct Core {
     /// The first TCP flows after the start or the latest network change,
     /// whose timing the runtime log breaks down.
     first_flows: Arc<first_flows::FirstFlows>,
+    /// The connection [`Core::network_changed`] is warming, which the next
+    /// change or a stop cancels.
+    prewarm: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+/// How long [`Core::network_changed`] may spend warming a connection: the
+/// server's lookup and the dial together.
+const PREWARM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What [`Core::network_changed`] did. Counts are of what was asked or
+/// dropped, not of connections that will recover.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetworkChangeReport {
+    /// Pooled carrier sessions and connections retired: Mux.Cool/XUDP
+    /// parents, `testpre` dialers, gRPC, XHTTP and HTTP/2 connections.
+    pub sessions_reset: u64,
+    /// Hysteria clients asked for a fresh socket.
+    pub hysteria_rebinds: u64,
+    /// Other QUIC connections (XHTTP H3, MASQUE, XDRIVE) and mKCP
+    /// connections told of the change.
+    pub quic_rebinds: u64,
+    /// WireGuard devices asked for a fresh socket.
+    pub wireguard_rebinds: u64,
+    /// Cached DNS answers and failures dropped.
+    pub dns_answers_dropped: u64,
+    /// Whether a connection to the current proxy is being warmed.
+    pub prewarm_started: bool,
 }
 
 struct CoreDnsDependencies {
@@ -955,6 +982,7 @@ impl Core {
             runtime_logger: RuntimeLogger::disabled(),
             fake_ip_store: FakeIpStore::process(),
             first_flows: Arc::default(),
+            prewarm: Mutex::new(None),
         })
     }
 
@@ -1085,6 +1113,120 @@ impl Core {
     /// of connections that survive.
     pub fn rebind_quic(&self) -> u64 {
         self.transport_dialer.network_changes().notify()
+    }
+
+    /// Recovers from an OS network change (Wi-Fi to cellular and back, a
+    /// network that came back) without a restart, which would lose the
+    /// fake-IP mappings apps hold:
+    ///
+    /// - pooled carrier sessions are retired, the outbounds staying open:
+    ///   Mux.Cool and XUDP parents close with their children, `testpre`
+    ///   connections held ahead close, and gRPC, XHTTP (HTTP/1.1, HTTP/2,
+    ///   HTTP/3) and HTTP/2 proxy connections leave their pools, keeping
+    ///   the streams already open on them. In-flight cold dials of a Mux or
+    ///   gRPC pool are abandoned;
+    /// - Hysteria, WireGuard and the other QUIC carriers take a fresh
+    ///   socket, as [`Self::rebind_hysteria`], [`Self::rebind_quic`] and
+    ///   [`Self::rebind_wireguard`] do, and mKCP connections fail or wait;
+    /// - cached DNS answers and failures of the destination and bootstrap
+    ///   resolvers are dropped, so names are looked up over the new network
+    ///   (fake-IP mappings are kept);
+    /// - on a running core, one connection to the proxy the latest TCP flow
+    ///   went through (else the default outbound) is opened ahead in the
+    ///   background, at most [`PREWARM_TIMEOUT`], and held for the next
+    ///   flow for 2.5 s; the next change or a stop cancels it;
+    /// - the runtime log times the next eight TCP flows again.
+    ///
+    /// Flows already open are left to the host, which can close them with
+    /// [`Self::close_connection`]. Idempotent apart from the counts.
+    pub async fn network_changed(&self) -> NetworkChangeReport {
+        let sessions_reset = self.outbound_factory().reset_sessions().await;
+        let hysteria_rebinds = self.rebind_hysteria();
+        let quic_rebinds = self.rebind_quic();
+        let wireguard_rebinds = self.rebind_wireguard();
+        let dns_answers_dropped = self.forget_dns_answers();
+        self.first_flows
+            .rearm(first_flows::FirstFlowCause::NetworkChange);
+        let prewarm_started = self.start_prewarm();
+        let report = NetworkChangeReport {
+            sessions_reset,
+            hysteria_rebinds,
+            quic_rebinds,
+            wireguard_rebinds,
+            dns_answers_dropped,
+            prewarm_started,
+        };
+        self.runtime_logger.info(|| {
+            format!(
+                "Network change: sessionsReset={sessions_reset} hysteria={hysteria_rebinds} quic={quic_rebinds} wireguard={wireguard_rebinds} dnsAnswersDropped={dns_answers_dropped} prewarm={prewarm_started}"
+            )
+        });
+        report
+    }
+
+    /// Drops the cached answers of every resolver this core keeps.
+    fn forget_dns_answers(&self) -> u64 {
+        let runtime = self.runtime.as_ref().map(|runtime| &runtime.probe_dns);
+        let resolvers = [
+            Some(&self.dns_resolver),
+            self.dns_bootstrap_resolver.as_ref(),
+            self.managed_dns_fallback_resolver.as_ref(),
+            runtime.map(|dns| &dns.destination),
+            runtime.map(|dns| &dns.bootstrap),
+        ];
+        // A resolver shared by several roles drops its answers once; asking
+        // it again finds none.
+        resolvers
+            .into_iter()
+            .flatten()
+            .map(|resolver| resolver.forget_cached_answers() as u64)
+            .sum()
+    }
+
+    /// Starts warming a connection to the current proxy on a running core,
+    /// cancelling the one an earlier change started.
+    fn start_prewarm(&self) -> bool {
+        let previous = self
+            .prewarm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return false;
+        };
+        if self.state != CoreState::Running {
+            return false;
+        }
+        let Some(outbound) = self.outbound_router.prewarm_target() else {
+            return false;
+        };
+        let resolver = Arc::clone(&runtime.probe_dns.bootstrap);
+        let dialer = Arc::clone(&self.transport_dialer);
+        let logger = self.runtime_logger.clone();
+        let task = tokio::spawn(async move {
+            let warmed = tokio::time::timeout(
+                PREWARM_TIMEOUT,
+                outbound.prewarm(resolver.as_ref(), dialer.as_ref()),
+            )
+            .await;
+            logger.info(|| match warmed {
+                Ok(Ok(true)) => "Network change: a connection to the proxy is ready".to_owned(),
+                Ok(Ok(false)) => "Network change: the proxy's server was looked up".to_owned(),
+                Ok(Err(_)) => "Network change: warming the proxy failed".to_owned(),
+                Err(_) => format!(
+                    "Network change: warming the proxy timed out after {} ms",
+                    PREWARM_TIMEOUT.as_millis()
+                ),
+            });
+        });
+        *self
+            .prewarm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task.abort_handle());
+        true
     }
 
     /// Rebinds live WireGuard carrier transports after an OS network change.
@@ -1645,6 +1787,14 @@ impl Core {
     }
 
     pub async fn stop(&mut self) -> Result<(), CoreError> {
+        if let Some(prewarm) = self
+            .prewarm
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            prewarm.abort();
+        }
         self.startup_probe_shutdown.signal();
         self.probe_shutdown.signal();
         self.shutdown.signal();
@@ -1985,6 +2135,10 @@ fn transport_dns_query_strategy(
         ConfigDnsQueryStrategy::UseIpv6 => TransportDnsQueryStrategy::UseIpv6,
     }
 }
+
+#[cfg(test)]
+#[path = "network_change_tests.rs"]
+mod network_change_tests;
 
 #[cfg(test)]
 mod tests {

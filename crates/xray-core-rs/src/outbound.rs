@@ -42,6 +42,8 @@ mod xhttp;
 mod xudp;
 pub(crate) use carrier::direct_udp_masks;
 use carrier::StreamCarrier;
+#[cfg(test)]
+pub(crate) use carrier::WARM_CARRIER_LIFETIME;
 mod freedom_udp;
 pub(crate) use freedom_udp::FreedomUdpSocket;
 
@@ -716,6 +718,18 @@ impl VlessTcpOutbound {
         }
     }
 
+    /// Closes the Mux.Cool/XUDP parents and the `testpre` connections held
+    /// ahead after a network change, keeping the outbound open: the next
+    /// flow dials over the network the device is on now.
+    pub(crate) fn reset_sessions(&self) -> u64 {
+        self.payload.mux.as_ref().map_or(0, mux::Runtime::reset)
+            + self
+                .payload
+                .pre_connections
+                .as_ref()
+                .map_or(0, preconnect::PreConnections::reset)
+    }
+
     pub(crate) async fn join(&self) {
         if let Some(mux) = &self.payload.mux {
             mux.join().await;
@@ -1230,6 +1244,50 @@ impl TcpOutbound {
             };
             chain_end_refusal(proxy, carrier.server.clone(), resolver).await
         })
+    }
+
+    /// Retires what this outbound keeps for later flows after a network
+    /// change, without closing it as [`OutboundFactory::close_sessions`]
+    /// does: Mux.Cool/XUDP parents and `testpre` connections are closed, and
+    /// gRPC, XHTTP and HTTP/2 connections leave their pools, keeping the
+    /// streams already open on them. The next flow dials over the network
+    /// the device is on now. Returns how many sessions and pooled
+    /// connections were retired.
+    pub(crate) fn reset_sessions(&self) -> Pin<Box<dyn Future<Output = u64> + Send + '_>> {
+        Box::pin(async move {
+            if let Self::Chained { outbound, proxy } = self {
+                return outbound.reset_sessions().await + proxy.reset_sessions().await;
+            }
+            let pooled = match self {
+                Self::Vless(vless) => vless.reset_sessions(),
+                Self::Trojan(trojan) => trojan.reset_sessions(),
+                Self::Vmess(vmess) => vmess.reset_sessions(),
+                Self::Shadowsocks2022(shadowsocks) => shadowsocks.reset_sessions(),
+                Self::Http(http) => http.reset_sessions(),
+                _ => 0,
+            };
+            let carried = match self.stream_carrier() {
+                Some(carrier) => carrier.reset_pools().await,
+                None => 0,
+            };
+            pooled + carried
+        })
+    }
+
+    /// Opens one connection to this outbound's server ahead of the next
+    /// flow, after a network change: see [`carrier::StreamCarrier::prewarm`].
+    /// Returns whether a connection is held for it.
+    pub(crate) async fn prewarm(
+        &self,
+        resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
+    ) -> Result<bool, CoreError> {
+        match self.stream_carrier() {
+            Some(carrier) if !matches!(self, Self::Chained { .. }) => {
+                carrier.prewarm(resolver, dialer).await
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Lets connections this outbound keeps for later flows close: an HTTP
@@ -3033,6 +3091,9 @@ pub struct OutboundRouter {
     routing_update_lock: Mutex<()>,
     default_is_dns: bool,
     default_requires_selection: bool,
+    /// One more than the index of the proxy leaf the latest TCP flow went
+    /// through; 0 before any. A network change warms a connection to it.
+    last_proxy: AtomicUsize,
 }
 
 impl OutboundRouter {
@@ -3061,7 +3122,39 @@ impl OutboundRouter {
             routing_update_lock: Mutex::new(()),
             default_is_dns,
             default_requires_selection,
+            last_proxy: AtomicUsize::new(0),
         }
+    }
+
+    /// Notes the proxy leaf a TCP flow is about to go through, for
+    /// [`Self::prewarm_target`]. One atomic load once it is noted.
+    fn note_tcp_proxy(&self, node: OutboundNodeId, outbound: &TcpOutbound) {
+        if node.graph_identity != self.graph().identity
+            || matches!(outbound, TcpOutbound::Chained { .. })
+            || outbound.stream_carrier().is_none()
+        {
+            return;
+        }
+        let noted = node.index + 1;
+        if self.last_proxy.load(Ordering::Relaxed) != noted {
+            self.last_proxy.store(noted, Ordering::Relaxed);
+        }
+    }
+
+    /// The outbound a network change warms a connection to: the proxy the
+    /// latest TCP flow went through, else the default outbound if it is a
+    /// proxy. Only outbounds that dial their server over a stream carrier
+    /// without a chain qualify; Hysteria, WireGuard and QUIC carriers move
+    /// to a fresh socket instead.
+    pub(crate) fn prewarm_target(&self) -> Option<TcpOutbound> {
+        let graph = self.graph();
+        let node = match self.last_proxy.load(Ordering::Relaxed).checked_sub(1) {
+            Some(index) => graph.nodes().get(index).map(OutboundNode::id),
+            None => graph.default_node(),
+        }?;
+        let outbound = self.factory.cached_tcp_outbound(node).ok()?;
+        (!matches!(outbound, TcpOutbound::Chained { .. }) && outbound.stream_carrier().is_some())
+            .then_some(outbound)
     }
 
     pub fn graph(&self) -> &OutboundGraph {
@@ -3332,6 +3425,9 @@ impl OutboundRouter {
                 .cached_tcp_outbound(node)
                 .map(TcpSessionOutbound::Transport),
         }?;
+        if let TcpSessionOutbound::Transport(transport) = &outbound {
+            self.note_tcp_proxy(node, transport);
+        }
         Ok(SelectedTcpSessionOutbound {
             outbound,
             tag,
@@ -4072,6 +4168,40 @@ impl OutboundFactory {
                 outbound.close();
             }
         }
+    }
+
+    /// Retires every pooled carrier session after a network change and
+    /// keeps the outbounds open, where [`Self::close_sessions`] closes them
+    /// for good: see [`TcpOutbound::reset_sessions`]. Hysteria, WireGuard
+    /// and QUIC carriers move to a fresh socket instead, through their
+    /// rebinds. Returns how many sessions and pooled connections were
+    /// retired.
+    pub(crate) async fn reset_sessions(&self) -> u64 {
+        if self.sessions_closed.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut retired = 0;
+        for entry in &self.entries {
+            if let Some(Ok(outbound)) = entry.tcp.get() {
+                retired += outbound.reset_sessions().await;
+            }
+            // A protocol compiled for UDP alone (XUDP over its Mux pool)
+            // has no TCP entry; one with a TCP entry shares its pools, which
+            // a second reset finds already empty.
+            if let Some(Ok(outbound)) = entry.vless.get() {
+                retired += outbound.reset_sessions() + outbound.carrier().reset_pools().await;
+            }
+            if let Some(Ok(outbound)) = entry.trojan.get() {
+                retired += outbound.reset_sessions() + outbound.carrier().reset_pools().await;
+            }
+            if let Some(Ok(outbound)) = entry.vmess.get() {
+                retired += outbound.reset_sessions() + outbound.carrier().reset_pools().await;
+            }
+            if let Some(Ok(outbound)) = entry.shadowsocks.get() {
+                retired += outbound.reset_sessions() + outbound.carrier().reset_pools().await;
+            }
+        }
+        retired
     }
 
     pub(crate) async fn join_sessions(&self) {
@@ -6909,6 +7039,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
@@ -10352,6 +10483,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
@@ -10399,6 +10531,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
@@ -10464,6 +10597,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
@@ -10554,6 +10688,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
@@ -10639,6 +10774,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
@@ -10711,6 +10847,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
@@ -10806,6 +10943,7 @@ mod tests {
                 },
                 encryption: None,
                 carrier: StreamCarrier {
+                    warm: Default::default(),
                     fragment: None,
                     folded_fragment_rules: None,
                     header_custom: None,
