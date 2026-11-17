@@ -256,6 +256,8 @@ typedef enum XrayFfiCapability {
 #define XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS 0x80000000ULL
 /* ABI 1.19: xray_core_network_changed. */
 #define XRAY_FFI_CAPABILITY_NETWORK_CHANGE 0x100000000ULL
+/* ABI 1.20: xray_set_crash_report_directory, xray_take_crash_reports. */
+#define XRAY_FFI_CAPABILITY_CRASH_REPORTS 0x200000000ULL
 
 /* ABI 1.9. Outcome written by xray_core_probe_outbound_url through an int32_t.
  * Failure kinds mirror the outbound health snapshot's lastFailureKind. */
@@ -292,6 +294,46 @@ uint64_t xray_ffi_capabilities(void);
  * ownership contract. Input remains unchanged for the duration of each call. */
 XrayStatus xray_profile_import_json(
     const uint8_t *request_json, size_t request_len,
+    char *buffer, size_t buffer_len, size_t *written, XrayError **error);
+
+/* ABI 1.20, CRASH_REPORTS. Process-wide and handle-free: call before or after
+ * cores exist, from any thread. From the first xray_core_new or call below on,
+ * a chained panic hook records every panic (message, location, thread, up to
+ * 32 frames / 8 KiB of backtrace as "image+0xoffset [symbol+0xoffset]" lines),
+ * and the core records the events that leave a tunnel up with nothing behind
+ * it: a runtime task that panicked or returned before stop, a TUN fd read or
+ * write loop that stopped on an I/O error, and counted DNS-anchor and
+ * flow-budget failures. At most 16 events are kept; a repeat of an event not
+ * yet taken raises its count. Messages are redacted: quoted text, addresses,
+ * domains, URLs, UUIDs and key-like tokens are replaced.
+ *
+ * Document (UTF-8 JSON, schemaVersion 1):
+ * {"schemaVersion":1,"pid":N,"startedUnixMs":N,"droppedEvents":N,
+ *  "events":[{"kind":"panic"|"taskPanic"|"taskExit"|"tunFdReadExit"|
+ *    "tunFdWriteExit"|"dnsAnchorFailure"|"flowBudgetExhausted",
+ *    "message":"...","location":"file:line:col"|null,"thread":"..."|null,
+ *    "backtrace":"..."|null,"unixMs":N,"firstUnixMs":N,"count":N}]}
+ * Unknown kinds and fields may be added within schemaVersion 1. */
+
+/* directory: an existing directory, or NULL to stop writing the file. While
+ * set, the events are mirrored to <directory>/xray-crash-report.json, written
+ * whole and renamed into place, at once for a new panic and at most every
+ * 250 ms otherwise, at most 64 KiB (oldest events left out and counted in
+ * droppedEvents). The file keeps taken events. The first call for a directory
+ * in a process first renames the file a previous process left to
+ * xray-crash-report.previous.json, then writes the current events, possibly
+ * none. Hosts read either file themselves; it is the document above, with
+ * the events of that process. Errors: INVALID_UTF8, INVALID_ARGUMENT for "",
+ * RUNTIME_ERROR for a directory that cannot hold the file, after which no
+ * file is written until a later call succeeds. */
+XrayStatus xray_set_crash_report_directory(
+    const char *directory, XrayError **error);
+/* Copies the events recorded since the last take and marks them taken.
+ * Size query: buffer=NULL, buffer_len=0 takes nothing; written receives the
+ * length excluding the trailing NUL. A buffer too small for the document and
+ * its NUL returns BUFFER_TOO_SMALL with the required length in written and
+ * takes nothing; events may arrive between a query and a take, so retry. */
+XrayStatus xray_take_crash_reports(
     char *buffer, size_t buffer_len, size_t *written, XrayError **error);
 
 XrayCoreHandle *xray_core_new(XrayError **error);

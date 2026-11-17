@@ -93,7 +93,10 @@ owns input, profile storage and the existing DNS bootstrap/startup path.
   provider), the runtime's worker threads (ABI 1.18, `runtimeWorkerThreads`
   of the `XrayCore` initializers), recovery
   from a network change without a restart (ABI 1.19, `networkChanged()`,
-  see [network change](../../docs/ffi.md#network-change)), and optional
+  see [network change](../../docs/ffi.md#network-change)), crash reports
+  (ABI 1.20, static `XrayCore.setCrashReportDirectory(_:)`,
+  `takeCrashReports()` and `readCrashReport(at:)`; see
+  [crash reports](../../docs/ffi.md#crash-reports)), and optional
   Darwin-utun fd discovery.
 - `XrayAppleShared`: profile/config models, secure config storage, sanitized
   logging, and app-to-extension message keys.

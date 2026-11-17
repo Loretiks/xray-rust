@@ -983,7 +983,7 @@ impl FlowBudgetState {
 
         let limit = self.policy.udp.max_active_flows;
         if limit == 0 {
-            self.udp_budget_drops = self.udp_budget_drops.saturating_add(1);
+            self.record_udp_budget_drop();
             return UdpFlowAdmission::Drop;
         }
 
@@ -1002,7 +1002,7 @@ impl FlowBudgetState {
         }
 
         if flows.len() >= limit {
-            self.udp_budget_drops = self.udp_budget_drops.saturating_add(1);
+            self.record_udp_budget_drop();
             return UdpFlowAdmission::Drop;
         }
 
@@ -1036,6 +1036,7 @@ impl FlowBudgetState {
 
     fn record_udp_budget_drop(&mut self) {
         self.udp_budget_drops = self.udp_budget_drops.saturating_add(1);
+        crate::crash_report::TUN_UDP_FLOW_BUDGET.note();
     }
 
     fn next_udp_sequence(&mut self) -> u64 {
@@ -1422,6 +1423,7 @@ fn log_bridge_task_result(result: Result<(), JoinError>, runtime_logger: &Runtim
             return;
         }
         runtime_logger.error(|| "Debug tunBridgeTask failed error=<redacted>".to_owned());
+        crate::crash_report::record_join_error("TUN flow task", error);
     }
 }
 
@@ -6204,11 +6206,14 @@ fn add_tcp_listener(
     }
 }
 
+/// A flow reset because a TUN flow budget is exhausted: counted for the crash
+/// report, which keeps no target, and reported as a TCP open error.
 fn record_tcp_admission_rejection(
     context: &TunRuntimeContext,
     endpoint: IpEndpoint,
     reason: &'static str,
 ) {
+    crate::crash_report::TUN_TCP_FLOW_BUDGET.note();
     let Some(target) = context.target_from_endpoint(endpoint, RoutingNetwork::Tcp) else {
         return;
     };

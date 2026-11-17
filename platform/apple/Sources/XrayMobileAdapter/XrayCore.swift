@@ -177,6 +177,11 @@ public struct XrayFFICapabilities: OptionSet, Equatable, Sendable {
     public static let networkChange = Self(
         rawValue: UInt64(XRAY_FFI_CAPABILITY_NETWORK_CHANGE)
     )
+    /// ABI 1.20, bit 33: `XrayCore.setCrashReportDirectory(_:)` and
+    /// `XrayCore.takeCrashReports()`.
+    public static let crashReports = Self(
+        rawValue: UInt64(XRAY_FFI_CAPABILITY_CRASH_REPORTS)
+    )
 }
 
 /// MTU of the host's TUN interface (ABI 1.16). Give the interface and the core
@@ -510,6 +515,87 @@ public struct XrayOutboundAccounting: Codable, Equatable, Sendable {
 }
 
 /// Controls whether the core may use the platform resolver for bootstrap lookups.
+/// The process-wide crash report (ABI 1.20): what `XrayCore.takeCrashReports()`
+/// returns and what the report files hold. See `XrayCore.readCrashReport(at:)`.
+public struct XrayCrashReport: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    /// The process that recorded the events.
+    public let pid: UInt32
+    /// When that process started recording, in Unix milliseconds.
+    public let startedUnixMs: UInt64
+    /// Events pushed out of the bounded ring before they were taken (or, in
+    /// a file, before they could be written).
+    public let droppedEvents: UInt64
+    public let events: [XrayCrashEvent]
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case pid
+        case startedUnixMs
+        case droppedEvents
+        case events
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        guard schemaVersion == 1 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .schemaVersion,
+                in: container,
+                debugDescription: "unsupported crash report schema: \(schemaVersion)"
+            )
+        }
+        pid = try container.decodeIfPresent(UInt32.self, forKey: .pid) ?? 0
+        startedUnixMs = try container.decodeIfPresent(UInt64.self, forKey: .startedUnixMs) ?? 0
+        droppedEvents = try container.decodeIfPresent(UInt64.self, forKey: .droppedEvents) ?? 0
+        events = try container.decodeIfPresent([XrayCrashEvent].self, forKey: .events) ?? []
+    }
+}
+
+/// One failure in an `XrayCrashReport`. Messages are redacted by the core.
+public struct XrayCrashEvent: Codable, Equatable, Sendable {
+    /// `panic`, `taskPanic`, `taskExit`, `tunFdReadExit`, `tunFdWriteExit`,
+    /// `dnsAnchorFailure` or `flowBudgetExhausted`; a newer library may add
+    /// kinds, so this is a string.
+    public let kind: String
+    public let message: String
+    /// `file:line:column` of a panic or of the code that recorded the event.
+    public let location: String?
+    public let thread: String?
+    /// A panic's return addresses, one `index image+0xoffset [symbol+0xoffset]`
+    /// line per frame, to symbolicate with the image's dSYM.
+    public let backtrace: String?
+    /// The latest occurrence, in Unix milliseconds.
+    public let unixMs: UInt64
+    /// The first occurrence; `count` occurrences happened in between.
+    public let firstUnixMs: UInt64
+    public let count: UInt64
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case message
+        case location
+        case thread
+        case backtrace
+        case unixMs
+        case firstUnixMs
+        case count
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(String.self, forKey: .kind)
+        message = try container.decodeIfPresent(String.self, forKey: .message) ?? ""
+        location = try container.decodeIfPresent(String.self, forKey: .location)
+        thread = try container.decodeIfPresent(String.self, forKey: .thread)
+        backtrace = try container.decodeIfPresent(String.self, forKey: .backtrace)
+        unixMs = try container.decodeIfPresent(UInt64.self, forKey: .unixMs) ?? 0
+        firstUnixMs = try container.decodeIfPresent(UInt64.self, forKey: .firstUnixMs) ?? unixMs
+        count = try container.decodeIfPresent(UInt64.self, forKey: .count) ?? 1
+    }
+}
+
 public enum XrayDNSBootstrapMode: Equatable, Sendable {
     /// Allows the platform resolver when config-backed resolution has no IP result.
     case system
@@ -2271,5 +2357,117 @@ public final class XrayCore: @unchecked Sendable {
         }
 
         return .status(code: code, message: message)
+    }
+}
+
+// MARK: - Crash reports (ABI 1.20)
+
+extension XrayCore {
+    /// The running process's report in the directory given to
+    /// `setCrashReportDirectory(_:)`.
+    public static let crashReportFileName = "xray-crash-report.json"
+    /// The report the previous process left there, moved aside when this
+    /// process first set the directory.
+    public static let previousCrashReportFileName = "xray-crash-report.previous.json"
+
+    /// Mirrors the process-wide crash report to `crashReportFileName` in
+    /// `directory`, which must exist, or stops writing it with `nil`.
+    /// Process-wide: call it before or after cores exist, as early as
+    /// possible in the tunnel process. The first call for a directory moves
+    /// the file the previous process left to `previousCrashReportFileName`,
+    /// then writes this process's events, possibly none, so read the previous
+    /// file afterwards to learn why the last tunnel process ended. Use a
+    /// directory per process (the tunnel's, not one shared with the app's
+    /// own core). Requires ABI 1.20 and `crashReports`.
+    public static func setCrashReportDirectory(_ directory: URL?) throws {
+        try requireCrashReports()
+        var error: OpaquePointer?
+        let status: XrayStatus
+        if let directory {
+            status = directory.path.withCString { pointer in
+                xray_set_crash_report_directory(pointer, &error)
+            }
+        } else {
+            status = xray_set_crash_report_directory(nil, &error)
+        }
+        try checkCrashReportStatus(status, error: error)
+    }
+
+    /// Returns the events recorded in this process since the last take and
+    /// clears them: panics anywhere in the process, runtime tasks that
+    /// panicked or stopped early, TUN descriptor loops that stopped, and
+    /// counted DNS-anchor and flow-budget failures. The report file keeps
+    /// them. Requires ABI 1.20 and `crashReports`.
+    public static func takeCrashReports() throws -> XrayCrashReport {
+        try requireCrashReports()
+        // Events may arrive between the size query and the take.
+        for _ in 0..<4 {
+            var error: OpaquePointer?
+            var requiredLength = 0
+            try checkCrashReportStatus(
+                xray_take_crash_reports(nil, 0, &requiredLength, &error),
+                error: error
+            )
+            error = nil
+            var buffer = [CChar](repeating: 0, count: requiredLength + 1)
+            var written = 0
+            let status = buffer.withUnsafeMutableBufferPointer { pointer in
+                xray_take_crash_reports(pointer.baseAddress, pointer.count, &written, &error)
+            }
+            if status == XRAY_STATUS_BUFFER_TOO_SMALL {
+                if let error {
+                    xray_error_free(error)
+                }
+                continue
+            }
+            try checkCrashReportStatus(status, error: error)
+            guard written < buffer.count else {
+                throw XrayCoreError.invalidUtf8
+            }
+            let data = Data(buffer.prefix(written).map { UInt8(bitPattern: $0) })
+            return try JSONDecoder().decode(XrayCrashReport.self, from: data)
+        }
+        throw XrayCoreError.status(
+            code: XRAY_STATUS_BUFFER_TOO_SMALL,
+            message: "crash reports kept growing while being taken"
+        )
+    }
+
+    /// `crashReportFileName`, or `previousCrashReportFileName`, in `directory`.
+    public static func crashReportFileURL(in directory: URL, previous: Bool = false) -> URL {
+        directory.appendingPathComponent(
+            previous ? previousCrashReportFileName : crashReportFileName,
+            isDirectory: false
+        )
+    }
+
+    /// Decodes a report file. Pure Swift: it works with any library version,
+    /// and from the app while the tunnel process is gone.
+    public static func readCrashReport(at fileURL: URL) throws -> XrayCrashReport {
+        try JSONDecoder().decode(XrayCrashReport.self, from: Data(contentsOf: fileURL))
+    }
+
+    private static func requireCrashReports() throws {
+        let info = ffiInfo
+        try validateFFIVersion(major: info.version.major, minor: info.version.minor)
+        guard info.version.minor >= 20 else {
+            throw XrayCoreError.incompatibleFFIMinorVersion(required: 20, actual: info.version.minor)
+        }
+        guard info.supports(.crashReports) else {
+            throw XrayCoreError.status(
+                code: XRAY_STATUS_RUNTIME_ERROR,
+                message: "required xray FFI capability is unavailable"
+            )
+        }
+    }
+
+    private static func checkCrashReportStatus(_ status: XrayStatus, error: OpaquePointer?) throws {
+        guard status != XRAY_STATUS_OK else {
+            if let error {
+                xray_error_free(error)
+            }
+            return
+        }
+        throw takeError(error, fallbackStatus: status)
     }
 }

@@ -209,11 +209,13 @@ final class XrayPacketTunnelPumpTests: XCTestCase {
     func testFFIInfoReportsCurrentCapabilities() {
         let info = XrayCore.ffiInfo
 
-        XCTAssertEqual(info.version, XrayFFIVersion(major: 1, minor: 19))
+        XCTAssertEqual(info.version, XrayFFIVersion(major: 1, minor: 20))
         XCTAssertTrue(info.supports(.runtimeWorkerThreads))
         XCTAssertEqual(XrayFFICapabilities.runtimeWorkerThreads.rawValue, 1 << 31)
         XCTAssertTrue(info.supports(.networkChange))
         XCTAssertEqual(XrayFFICapabilities.networkChange.rawValue, 1 << 32)
+        XCTAssertTrue(info.supports(.crashReports))
+        XCTAssertEqual(XrayFFICapabilities.crashReports.rawValue, 1 << 33)
         XCTAssertTrue(info.supports(.hysteriaStreamLimits))
         XCTAssertTrue(info.supports(.tunMtu))
         XCTAssertTrue(info.supports(.hysteria2Outbound))

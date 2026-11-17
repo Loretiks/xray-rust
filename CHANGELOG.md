@@ -357,6 +357,195 @@ qualification are pending.
   audits the upstream release under each vendored crate and every git
   dependency against RustSec, which `cargo audit` does not see.
 
+- Crash reports, so a host can show why a tunnel died or went quiet instead
+  of a nameless disconnect. A panic hook, installed once by the first
+  `xray_core_new` and chaining the previous hook, records every panic in the
+  process, task panics Tokio catches included, with message, location, thread
+  and up to 32 frames / 8 KiB of image-relative backtrace. The core adds a
+  supervised runtime task (TUN loop, inbounds, observatory, TUN flows and fd
+  pumps, mux, MASQUE, pre-connections) that panicked or returned before stop,
+  a TUN fd loop that stopped on an I/O error, and counted DNS-anchor and
+  flow-budget failures. A bounded ring keeps 16 events and counts repeats;
+  messages are redacted (quoted text, addresses, domains, URLs, UUIDs,
+  key-like tokens). ABI 1.20 adds `CRASH_REPORTS` (bit 33),
+  `xray_set_crash_report_directory`, which mirrors the ring to
+  `xray-crash-report.json` with one bounded write and rename, moving the
+  previous process's file to `xray-crash-report.previous.json`, and
+  `xray_take_crash_reports`, which returns the new events as JSON and clears
+  them. Swift: `XrayCore.setCrashReportDirectory(_:)`, `takeCrashReports()`
+  and `readCrashReport(at:)`.
+- The observatory skips the scheduled probe of a balancer's member while no
+  flow has been routed through the balancer since that member's last probe,
+  so a phone nobody uses no longer wakes its radio every `probeInterval`
+  (10 seconds by default). The first round probes every observed outbound;
+  the first flow through a balancer whose members were skipped has them
+  probed at once, and failure re-probes run as before. Observed outbounds
+  outside every balancer keep the interval. Selecting through a balancer
+  records its use: one atomic load per flow once the current round has seen
+  one.
+- The mobile, mobile-plus and low-memory TUN runtime profiles, and the
+  default profile on Android, iOS, tvOS and watchOS, run the FFI handle's
+  Tokio runtime on 2 worker threads, as the CLI does, where they ran on the
+  available parallelism up to 6. Measured with eight flows, 2 workers moved
+  72-74 Gbit/s for 330-360 ms of CPU and 6 workers 55-58 Gbit/s for 590-660
+  ms. The desktop and throughput profiles, and the default profile on other
+  targets, keep their count. ABI 1.18 adds
+  `xray_core_set_runtime_worker_threads` (`RUNTIME_WORKER_THREADS`, bit 31,
+  the first capability defined as a 64-bit macro since a C enum constant
+  cannot hold it) to set 1..=64 workers, or 0 for the profile's count, before
+  config load, and Swift `XrayCore` initializers take an optional
+  `runtimeWorkerThreads`. Selecting a profile or a count replaces the
+  handle's still idle runtime when the count changes.
+- The TUN loop no longer wakes every second. It slept at most a second for
+  its statistics, so an idle VPN, with no flows or only idle ones, woke the
+  process 45 to 50 times a minute where the same core without TUN woke none
+  (measured on macOS). It now sleeps until a packet, a flow event, smoltcp's
+  next timer or a housekeeping deadline: the close-wait sweep, the expiry of
+  a pooled DNS-over-TCP connection, and the TCP buffer statistics, recorded
+  a second after activity and every second while upload bytes wait for their
+  outbound. Retransmissions, delayed ACKs, the 30-second linger, the
+  four-minute give-up and UDP idle eviction keep their timing, and the
+  statistics are still at most a second behind the last activity.
+- The TUN stack no longer verifies the checksums of the IPv4 headers and TCP
+  segments the host writes into it a second time: the host's network stack
+  computed them and hands the packets over in memory, and each IPv4 header
+  checksum is still checked once before a packet reaches smoltcp. This saves
+  a pass over every uploaded byte; a TCP segment with a wrong checksum is now
+  taken as it is. Packets the stack sends keep their computed checksums.
+- An idle TUN TCP flow holds about 80 KiB of heap instead of 146 KiB. Its
+  bridge kept a 64 KiB read buffer for the flow's whole life and copied every
+  read out of it; it now reads into a buffer on the stack and continues in a
+  heap chunk only when more is ready, which goes to the stack without the
+  copy. The smoltcp socket no longer takes its two 32 KiB buffers at the SYN:
+  it starts with an 8 KiB receive buffer (two segments at least) and no send
+  buffer, and grows them when the flow's bridge starts reading the client's
+  data and when the remote sends its first bytes, so SYNs that are never
+  completed and flows whose outbound is still connecting cost a few KiB each.
+  A grown receive window is announced at once. The vendored smoltcp gains
+  `Socket::grow_recv_buffer` and `Socket::grow_send_buffer` for this. The
+  upload side releases its coalescing buffer once nothing waits to be written,
+  and a freedom UDP flow no longer keeps a 16 KiB receive buffer.
+- A TUN UDP flow's queue to its outbound is bounded in bytes as well as in
+  datagrams: 64 KiB per flow and 2 MiB across flows on the `LowMemory` TUN
+  profile, 128 KiB and 4 MiB on `Mobile`, 256 KiB and 8 MiB on `MobilePlus`,
+  512 KiB and 64 MiB on `Desktop`, 1 MiB and 128 MiB on `Throughput`. A flow
+  could queue 256 datagrams, and every queued datagram was a slice of the
+  64 KiB buffer the TUN descriptor had been read into, so it kept that whole
+  buffer alive: a slow outbound let one flow hold up to 16 MiB, and a burst
+  over many flows enough to pass the 50 MB an iOS Network Extension may use.
+  A datagram over a limit is dropped, as one that finds its queue full, and
+  counted in `udp_channel_dropped_packets`; the flow stays up. Queued
+  datagrams now have allocations of their own, and so do the first packet a
+  UDP flow kept for an ICMP reply for as long as the flow lasted (it is now
+  released once the flow is routed), a DNS query the TUN answers itself, and
+  a datagram held while a TUN admission callback decides.
+- A geosite or geoip category is compiled once per process and shared by
+  every configuration that names it, so a host that restarts the core with a
+  new handle on each server switch no longer decodes and rebuilds the same
+  categories each time. The cache key is the file's identity (path, device
+  and inode, size, modification and status-change times), the code, the
+  attribute filter and, when a name ends with a dot, the name mode: a geodata
+  file the host rewrites or replaces is compiled again. Categories no
+  configuration references are kept up to 4 MiB for the next core and
+  released beyond that when a handle is freed; `xray_config` adds
+  `geodata_cache_stats`, `trim_geodata_cache` and `release_unused_geodata`.
+  Domain matchers also take less memory: the `full:` and `domain:` names of a
+  set are packed into one buffer grouped by a keyed hash
+  (`xray_routing::DomainPatternSet`) instead of one heap allocation and
+  hash-set slot each, and geodata entries are read in place instead of being
+  decoded into a `String` per domain and a `Vec` per CIDR; a body that is not
+  plain protobuf is still decoded by prost. Matching is unchanged. On macOS
+  with a 73,515-domain `geosite:ru-blocked` and an 88,587-CIDR
+  `geoip:ru-blocked`, the first core start went from +23.0 MiB footprint and
+  44 ms to +3.7 MiB and 26 ms, a restart from +2.9-4.1 MiB and 42 ms to under
+  0.1 MiB and 0.2 ms, and six restarts from +41.9 MiB to +4.1 MiB
+  ([benchmarks](docs/benchmarks.md#geodata-restart-memory)).
+  `DomainMatcherSet` equality now compares normalized patterns, however they
+  are stored, and `DomainMatcherSetError` has a `TooLarge` variant for a
+  table beyond 4 GiB.
+- `dns.servers` takes up to 32 entries, where more than eight failed to
+  parse. Xray-core sets no limit, and full subscriptions list more than
+  eight. Destination lookups use every server; the TUN DNS proxy at
+  `198.18.0.1` still forwards to the first eight distinct ones, which share
+  its five-second budget.
+- RAW's `http` header obfuscation works (`tcpSettings`/`rawSettings`
+  `header.type: "http"`), where it was refused: every connection sends a
+  request head built as Xray-core builds it (method, a drawn path, headers
+  sorted by name with drawn values, or Xray-core's Chrome headers by default)
+  before its first bytes, above TLS or REALITY when set, and drops the
+  server's response head, at most 8192 bytes, before its first read. Vision
+  is refused on it, as in Xray-core. Request text with a carriage return or
+  line feed fails.
+- Xray-core's FakeDNS works: a `fakedns` entry in `dns.servers`, refused
+  until now, turns on `dns.fakeIp` with the first IPv4 pool of root
+  `fakeDns` (an object or an array, also spelled `fakedns`) and its
+  `poolSize`, or Xray-core's automatic `198.18.0.0/15` without one.
+  Destination lookups never ask the entry. IPv6 pools are ignored with a
+  warning, as fake addresses are IPv4 only, and every name gets a fake
+  address, with a warning where Xray-core's server plan would have left some
+  names to other servers. An explicit `dns.fakeIp` wins.
+- `sockopt.domainStrategy` works on VLESS, VMess, Trojan, Shadowsocks, SOCKS,
+  HTTP and Hysteria outbounds and on an XHTTP download leg, where any value
+  but `AsIs` was refused. A domain server resolves to the families the
+  strategy asks for before it is dialed, as Xray-core's `DialSystem` resolves
+  it: `UseIPv4` dials only IPv4 addresses and falls back to all of them when
+  there is none, `ForceIPv4` fails instead, and the `v4v6`/`v6v4` forms try
+  one family, then the other. The bootstrap resolver answers, as without a
+  strategy. A strategy beside `dialerProxy` or `proxySettings` on such an
+  outbound is refused, since the chain would carry the server's name.
+- `localhost` works as a DNS server, as Xray-core's system-resolver client,
+  where it was refused. It asks the resolver the core bootstraps with
+  (`dns.hosts`, then the platform resolver) instead of the wire, bypassing
+  routing, and its `domains` gain Xray-core's local rules, so dotless names
+  and `.local`, `.lan`, `.home.arpa` and the reserved suffixes go to it
+  first. Answers carry the platform's TTL or Xray-core's 300 seconds and are
+  cached like other servers'. Under the `StaticOnly` bootstrap mode it answers
+  only from `dns.hosts`, and the next server takes the other names. The TUN
+  DNS proxy asks it locally over UDP and TCP.
+- Full Xray JSON subscriptions with fields Xray-core accepts and that change
+  nothing here now start, with a warning for each, where they failed to
+  parse: root `stats`, `api`, `metrics`, `version` and `geodata` objects,
+  `routing.domainMatcher`, `sockopt.tcpNoDelay`, mKCP `congestion`,
+  `readBufferSize` and `writeBufferSize`, and TLS `minVersion`, `maxVersion`,
+  `cipherSuites`, `curvePreferences`, `useSystemCA` and `show`. A uTLS
+  fingerprint decides the TLS four, as in Xray-core. `echConfigList` is
+  accepted without ECH, so the server name goes out in the clear, as its
+  warning says. `disableSystemRoot: true` is accepted only beside
+  `pinnedPeerCertSha256` and still fails without one, since ignoring it would
+  trust roots the config turned off. Values Go's decoding refuses, and
+  unknown keys, still fail.
+- A WireGuard device or MASQUE tunnel no longer refuses a TCP flow past its
+  limit at once. The flow waits for an earlier one to close, in arrival
+  order, for up to ten seconds, and only then tries its addresses, so the
+  wait does not spend an address's three-second attempt. At most twice the
+  limit may wait; past that, or after the ten seconds, the flow is refused
+  as an exhausted flow budget, which does not count against the outbound's
+  health, and a waiting flow that is cancelled leaves the queue at once.
+  The limit follows the TUN runtime profile, each flow's buffers sized with
+  it: 32 flows of 256 KiB each way on `LowMemory` (16 MiB), 64 of 256 KiB on
+  `Mobile` and `MobilePlus` (32 MiB, what 16 flows of 1 MiB took), 128 of
+  1 MiB on `Desktop` and `Throughput`; `Default` follows the target. Each
+  tunnel took 16 TCP flows, idle ones included, and refused the seventeenth,
+  so a phone browser, which opens more for one page and keeps them open,
+  broke pages over WARP and WireGuard. On the phone profiles one flow's
+  receive window is now at most 256 KiB, which bounds a single download to
+  256 KiB a round trip. `xray-wireguard` adds `FlowLimits`,
+  `Client::start_with_limits`, `Netstack::start_with_limits`, `tcp_slot`,
+  `connect_with_slot` and `waiting_tcp_flows`; the existing constructors take
+  the target's limits.
+- The DNS resolver and the system SRV/TXT lookups refuse a name longer than
+  255 octets, as Xray-core does through Go's `dnsmessage`. A name was read
+  for up to 32 labels and pointers, about 2 KB, so a forged 64 KB answer over
+  TCP, DoH or DoQ whose 4,000 records all pointed at one such name held some
+  8 MB while it was parsed, a sizeable share of an iOS tunnel extension's
+  memory limit.
+- The release fuzz campaign also covers the parsers an on-path censor or a
+  hostile server can feed and that had no target: DNS responses (A/AAAA and
+  SRV/TXT), the HTTP, TLS ClientHello, BitTorrent and uTP sniffers, mKCP
+  segments under every mask stack, MASQUE capsules, and the finalmask
+  decoders (Salamander with Gecko reassembly, `header-custom` over UDP and
+  TCP, sudoku datagrams and streams, xdns, xicmp, realm and xmc). Six targets
+  join the campaign and the seed-corpus replay.
 - A Hysteria connect attempt to the last of the server's addresses, the only
   one for a server with one address, gets what is left of the dial's ten
   seconds, at most eight, where every attempt had three. Quinn's first probe
