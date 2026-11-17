@@ -8,7 +8,7 @@ source of truth for declarations and enum values.
 ## ABI version
 
 Call `xray_ffi_version_major()` and `xray_ffi_version_minor()` before creating a
-handle. The current ABI version is `1.19`. The checked-in Swift and JNI adapters
+handle. The current ABI version is `1.20`. The checked-in Swift and JNI adapters
 reject any major other than `1` and require minor `1` or newer. Their selector
 and health methods require the corresponding ABI 1.2 capability bits; their
 connection-management methods require the ABI 1.3 capability bit, and routing
@@ -34,6 +34,8 @@ Setting the runtime's worker threads requires minor >=18 and
 `RUNTIME_WORKER_THREADS` (bit 31); see [runtime worker threads](#runtime-worker-threads).
 Recovering from a network change in one call requires minor >=19 and
 `NETWORK_CHANGE` (bit 32); see [network change](#network-change).
+Crash reports require minor >=20 and `CRASH_REPORTS` (bit 33); see
+[crash reports](#crash-reports).
 
 An incompatible function signature, enum representation, ownership rule, or
 required struct layout requires a major version change. Consumers should
@@ -51,7 +53,8 @@ the same change as its optional API; it does not override major/minor
 compatibility checks. Bits 0 to 30 are constants of the `XrayFfiCapability`
 enum. A C enum constant is an `int`, so bits from 31 on are 64-bit macros
 instead (`#define XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS 0x80000000ULL`,
-`#define XRAY_FFI_CAPABILITY_NETWORK_CHANGE 0x100000000ULL`), which Swift
+`#define XRAY_FFI_CAPABILITY_NETWORK_CHANGE 0x100000000ULL`,
+`#define XRAY_FFI_CAPABILITY_CRASH_REPORTS 0x200000000ULL`), which Swift
 imports as `UInt64`.
 
 ## Offline profile import
@@ -223,7 +226,8 @@ capability.
 1. Verify `xray_ffi_version_major()` and require a sufficient
    `xray_ffi_version_minor()`.
 2. Read `xray_ffi_capabilities()` and select only supported optional surfaces.
-3. Allocate a handle with `xray_core_new`.
+3. Allocate a handle with `xray_core_new`. Set the process-wide
+   [crash report](#crash-reports) directory once, before or after it.
 4. Configure optional pre-load settings:
    - geodata search directory;
    - file logging;
@@ -261,6 +265,94 @@ shared by every handle whose config names them, so the next handle a host
 creates after a server switch reuses them. `xray_core_free` releases the
 categories no other handle references beyond a 4 MiB budget kept for that
 next handle; see [geodata](config-compatibility.md#geodata).
+
+## Crash reports
+
+A Network Extension that dies, or a tunnel that stays up while nothing
+moves, otherwise reaches the host as a nameless disconnect. ABI 1.20 adds
+capability bit 33, `CRASH_REPORTS`, and two process-wide, handle-free calls
+that may run from any thread, before or after cores exist:
+
+```c
+XrayStatus xray_set_crash_report_directory(const char *directory, XrayError **error);
+XrayStatus xray_take_crash_reports(char *buffer, size_t buffer_len,
+                                   size_t *written, XrayError **error);
+```
+
+From the first `xray_core_new` or either call on, a panic hook (installed once,
+calling the hook installed before it, so panics are still printed) records
+every panic in the process, also the ones Tokio catches in a task. The core
+adds the events that leave a tunnel up with nothing behind it:
+
+| `kind` | Recorded when |
+| --- | --- |
+| `panic` | Any panic: message, `file:line:column`, OS thread name and up to 32 frames / 8 KiB of backtrace. A panic that cannot unwind aborts the process right after. |
+| `taskPanic` | A supervised task panicked: the TUN loop, a SOCKS or HTTP inbound or one of its connections, a TPROXY inbound, the reverse bridge, the observatory, a TUN flow, the TUN fd read/write loops, a VLESS mux connection or pre-connection dialer, a MASQUE tunnel's dial or pumps. The message names the task. |
+| `taskExit` | The TUN loop, an inbound listener, the reverse bridge or the observatory returned before the core was stopped. |
+| `tunFdReadExit` / `tunFdWriteExit` | The direct TUN fd pump stopped on a fatal I/O error (`EBADF`, `ENXIO`, `ENOTCONN`, EOF), with the error text. |
+| `dnsAnchorFailure` | Queries to the TUN DNS anchor failed on every upstream and were answered SERVFAIL. |
+| `flowBudgetExhausted` | New TUN TCP flows were refused, or UDP flows/DNS queries dropped, for a full flow budget. |
+
+The last two are counters: the first occurrence is added at once, later ones
+at most every 5 s, and the rest on the next take; no per-packet or per-flow
+event is made. An event that recurs before a take raises its `count` and
+`unixMs` instead of taking another slot. The ring keeps 16 events; when full
+the oldest leaves and, if it was not taken yet, counts in `droppedEvents`.
+
+Messages are redacted before they are stored: double-quoted text (how
+`Debug` prints strings, such as a value in an `unwrap` message), IP addresses
+and socket addresses, URLs, `user@host`, domains, UUIDs and long key-like
+tokens become `<redacted>`, `<redacted-ip>`, `<redacted-url>`,
+`<redacted-domain>` or `<redacted-uuid>`; messages are cut at 1 KiB.
+Backtrace lines are `index image+0xoffset [symbol+0xoffset]` with the image's
+file name only, never its directory. Symbolicate with the dSYM:
+`atos -o Tunnel.dSYM/Contents/Resources/DWARF/Tunnel -l 0x100000000 <0x100000000+offset>`.
+Frames come from the platform unwinder on Apple, Linux and Android targets
+except 32-bit ARM, where `backtrace` is `null`.
+
+The document, `schemaVersion` 1, is UTF-8 JSON:
+
+```json
+{"schemaVersion":1,"pid":4242,"startedUnixMs":1700000000000,"droppedEvents":0,
+ "events":[{"kind":"panic","message":"index out of bounds: the len is 3 but the index is 5",
+  "location":"crates/xray-core-rs/src/tun.rs:120:9","thread":"xray-ffi",
+  "backtrace":" 0 Tunnel+0x1a2b3c\n 1 Tunnel+0x1a2000\n","unixMs":1700000000500,
+  "firstUnixMs":1700000000500,"count":1}]}
+```
+
+`location`, `thread` and `backtrace` may be `null`; later minors may add kinds
+and fields within schema 1, so ignore unknown ones.
+
+`xray_take_crash_reports` returns the events recorded since the last take and
+marks them taken. `buffer = NULL, buffer_len = 0` is a size query that takes
+nothing. A buffer too small for the document and its NUL returns
+`BUFFER_TOO_SMALL`, the required length in `written`, and takes nothing.
+Events may arrive between a query and a take, so retry a short buffer.
+
+`xray_set_crash_report_directory(directory)` mirrors the ring, taken events
+included, to `<directory>/xray-crash-report.json` (`NULL` stops it). The
+directory must exist. The file is the same document for the events of the
+writing process, at most 64 KiB (oldest events left out and counted). It is
+written whole, from a buffer reserved when the directory is set, to a
+temporary file renamed into place: at once for a new panic, at most every
+250 ms for anything else (a skipped write is made by the next event or take).
+The first call for a directory in a process renames the file a previous
+process left to `xray-crash-report.previous.json`, then writes the current
+events, possibly none. A tunnel process that sets the directory early thus
+leaves either its last failures or an empty event list; an empty list after a
+dead extension points away from Rust panics, at a kill from outside (the iOS
+memory limit) or a crash in host code. Use one directory per process role:
+two processes setting the same one move each other's files aside. Hosts read
+the files themselves, with any library version; no FFI call is needed.
+`RUNTIME_ERROR` reports a directory that cannot hold the file, after which
+nothing is written until a later call succeeds; the message never contains
+the path.
+
+Swift: `XrayCore.setCrashReportDirectory(_:)`, `XrayCore.takeCrashReports()`
+(both require ABI 1.20 and `crashReports`), `XrayCore.readCrashReport(at:)`
+(pure Swift), `XrayCore.crashReportFileURL(in:previous:)` and the
+`XrayCrashReport`/`XrayCrashEvent` models. Rust hosts use
+`xray_core_rs::crash_report`.
 
 ## Handles and errors
 

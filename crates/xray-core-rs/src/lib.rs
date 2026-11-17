@@ -24,6 +24,7 @@ use xray_transport::{
 use xray_tun::{TunConfig, TunEndpoint};
 
 mod connection;
+pub mod crash_report;
 mod debug_log;
 mod dns;
 mod dns_outbound;
@@ -1586,34 +1587,46 @@ impl Core {
             let dns_resolvers = runtime_dns_resolvers.clone();
             let transport_dialer = Arc::clone(&self.transport_dialer);
             let task = match protocol {
-                InboundProtocol::Socks(settings) => tokio::spawn(socks::serve_socks_listener(
-                    listener,
-                    Arc::new(settings),
-                    inbound_tag,
-                    Arc::clone(&config),
-                    Arc::clone(&outbound_router),
-                    dns_resolvers,
-                    transport_dialer,
-                    sniffing,
-                    policy,
-                    self.runtime_logger.clone(),
-                    Arc::clone(&self.connection_registry),
-                    self.shutdown.subscribe(),
-                )),
-                InboundProtocol::Http(settings) => tokio::spawn(http::serve_http_listener(
-                    listener,
-                    Arc::new(settings.accounts),
-                    inbound_tag,
-                    Arc::clone(&config),
-                    Arc::clone(&outbound_router),
-                    dns_resolvers,
-                    transport_dialer,
-                    sniffing,
-                    policy,
-                    self.runtime_logger.clone(),
-                    Arc::clone(&self.connection_registry),
-                    self.shutdown.subscribe(),
-                )),
+                InboundProtocol::Socks(settings) => {
+                    tokio::spawn(crash_report::supervise_until_shutdown(
+                        "SOCKS inbound listener",
+                        self.shutdown.subscribe(),
+                        socks::serve_socks_listener(
+                            listener,
+                            Arc::new(settings),
+                            inbound_tag,
+                            Arc::clone(&config),
+                            Arc::clone(&outbound_router),
+                            dns_resolvers,
+                            transport_dialer,
+                            sniffing,
+                            policy,
+                            self.runtime_logger.clone(),
+                            Arc::clone(&self.connection_registry),
+                            self.shutdown.subscribe(),
+                        ),
+                    ))
+                }
+                InboundProtocol::Http(settings) => {
+                    tokio::spawn(crash_report::supervise_until_shutdown(
+                        "HTTP inbound listener",
+                        self.shutdown.subscribe(),
+                        http::serve_http_listener(
+                            listener,
+                            Arc::new(settings.accounts),
+                            inbound_tag,
+                            Arc::clone(&config),
+                            Arc::clone(&outbound_router),
+                            dns_resolvers,
+                            transport_dialer,
+                            sniffing,
+                            policy,
+                            self.runtime_logger.clone(),
+                            Arc::clone(&self.connection_registry),
+                            self.shutdown.subscribe(),
+                        ),
+                    ))
+                }
                 InboundProtocol::Tun | InboundProtocol::Tproxy(_) => continue,
             };
             inbounds.push(bound);
@@ -1635,10 +1648,10 @@ impl Core {
                 logger: self.runtime_logger.clone(),
                 registry: Arc::clone(&self.connection_registry),
             };
-            tasks.push(tokio::spawn(socks::tproxy::serve(
-                bound,
-                context,
+            tasks.push(tokio::spawn(crash_report::supervise_until_shutdown(
+                "TPROXY inbound",
                 self.shutdown.subscribe(),
+                socks::tproxy::serve(bound, context, self.shutdown.subscribe()),
             )));
         }
         for (index, settings, level) in bridges {
@@ -1653,9 +1666,10 @@ impl Core {
                 self.runtime_logger.clone(),
                 Arc::clone(&self.connection_registry),
             ) {
-                tasks.push(tokio::spawn(reverse::run_bridge(
-                    context,
+                tasks.push(tokio::spawn(crash_report::supervise_until_shutdown(
+                    "reverse bridge",
                     self.shutdown.subscribe(),
+                    reverse::run_bridge(context, self.shutdown.subscribe()),
                 )));
             }
         }
@@ -1668,7 +1682,7 @@ impl Core {
                     || self.runtime_logger.is_enabled(),
                 ..self.tun_runtime_options
             };
-            tasks.push(tokio::spawn(tun::serve_tun_endpoint(
+            let tun_loop = tun::serve_tun_endpoint(
                 Arc::clone(&self.tun),
                 tun_inbound_tag,
                 tun_inbounds
@@ -1691,6 +1705,13 @@ impl Core {
                 self.runtime_logger.clone(),
                 Arc::clone(&self.first_flows),
                 self.shutdown.subscribe(),
+            );
+            // The loop that moves every TUN packet: a panic or early return
+            // leaves the tunnel up with nothing behind it.
+            tasks.push(tokio::spawn(crash_report::supervise_until_shutdown(
+                "TUN loop",
+                self.shutdown.subscribe(),
+                tun_loop,
             )));
             if let Some(task) = runtime_stats_log::spawn_runtime_stats_logger(
                 Arc::clone(&self.tun),
@@ -1757,8 +1778,11 @@ impl Core {
                     Arc::clone(&runtime_dns_resolvers.bootstrap),
                     Arc::clone(&self.transport_dialer),
                 );
-                let task =
-                    tokio::spawn(health::run_observatory(runtime, self.shutdown.subscribe()));
+                let task = tokio::spawn(crash_report::supervise_until_shutdown(
+                    "observatory",
+                    self.shutdown.subscribe(),
+                    health::run_observatory(runtime, self.shutdown.subscribe()),
+                ));
                 self.runtime
                     .as_mut()
                     .expect("running core retains runtime state")

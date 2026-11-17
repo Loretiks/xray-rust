@@ -110,7 +110,9 @@ pub async fn serve_http_listener(
                 });
             }
             joined = connections.join_next(), if !connections.is_empty() => {
-                let _ = joined;
+                if let Some(Err(error)) = joined {
+                    crate::crash_report::record_join_error("HTTP inbound connection task", error);
+                }
             }
         }
     }

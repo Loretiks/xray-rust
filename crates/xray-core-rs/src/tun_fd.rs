@@ -69,6 +69,7 @@ mod platform {
     use xray_tun::{TunEndpoint, TunError};
 
     use super::{TunFdConfig, MAX_IP_PACKET_SIZE};
+    use crate::crash_report::{self, CrashEventKind};
     use crate::TunFdPacketFormat;
 
     const DARWIN_UTUN_HEADER_LEN: usize = 4;
@@ -97,13 +98,21 @@ mod platform {
             // that descriptor, which stays open until AsyncFd drops the owner.
             let fd = Arc::new(unsafe { AsyncFd::register(inner) }?);
             let (shutdown, shutdown_rx) = watch::channel(false);
-            let read_task = tokio::spawn(read_loop(
-                Arc::clone(&fd),
-                Arc::clone(&tun),
-                shutdown_rx.clone(),
-                packet_format,
+            // Nobody joins these until stop, so a panic is recorded as it
+            // happens; an I/O error that ends a loop is recorded by the loop.
+            let read_task = tokio::spawn(crash_report::catch_task_panic(
+                "TUN descriptor read loop",
+                read_loop(
+                    Arc::clone(&fd),
+                    Arc::clone(&tun),
+                    shutdown_rx.clone(),
+                    packet_format,
+                ),
             ));
-            let write_task = tokio::spawn(write_loop(fd, tun, shutdown_rx, packet_format));
+            let write_task = tokio::spawn(crash_report::catch_task_panic(
+                "TUN descriptor write loop",
+                write_loop(fd, tun, shutdown_rx, packet_format),
+            ));
 
             Ok(Self {
                 shutdown,
@@ -333,6 +342,10 @@ mod platform {
                                 }
                                 TunFdLoopAction::Stop => {
                                     tun.record_tun_fd_read_loop_exit();
+                                    crash_report::record(
+                                        CrashEventKind::TunFdReadExit,
+                                        &format!("TUN descriptor read loop stopped: {err}"),
+                                    );
                                     break;
                                 }
                             }
@@ -457,6 +470,10 @@ mod platform {
                         finish_tun_fd_write_batch(tun, written_packets_in_batch);
                     }
                 } else if action == TunFdLoopAction::Stop {
+                    crash_report::record(
+                        CrashEventKind::TunFdWriteExit,
+                        &format!("TUN descriptor write loop stopped: {error}"),
+                    );
                     tun.record_tun_fd_outbound_drops(batch.len() - *next_packet);
                     *next_packet = batch.len();
                     finish_tun_fd_write_batch(tun, written_packets_in_batch);
@@ -1384,6 +1401,8 @@ mod platform {
 
         #[tokio::test]
         async fn fatal_write_error_counts_the_unwritten_tail_as_dropped() {
+            let _crash_report = crate::crash_report::TEST_LOCK.lock().await;
+            crate::crash_report::take_json();
             let tun = test_tun_endpoint();
             let batch = test_packet_batch();
             let mut writer = ScriptedPacketBatchWriter::new([ScriptedBatchWrite::Fail(
@@ -1413,6 +1432,13 @@ mod platform {
             assert_eq!(stats.tun_fd_write_batch_packets, 1);
             assert_eq!(stats.dropped_packets, 2);
             assert_eq!(stats.outbound_dropped_packets, 2);
+            // The host learns why the tunnel went quiet.
+            let report = crate::crash_report::take_json();
+            assert!(report.contains(r#""kind":"tunFdWriteExit""#), "{report}");
+            assert!(
+                report.contains("TUN descriptor write loop stopped: Bad file descriptor"),
+                "{report}"
+            );
         }
 
         #[tokio::test]

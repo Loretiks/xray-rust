@@ -70,6 +70,23 @@ long-term supported release series.
   audits the upstream release under each vendored crate and every git
   dependency against RustSec, which `cargo audit` does not see.
 
+- Crash reports, so a host can show why a tunnel died or went quiet instead
+  of a nameless disconnect. A panic hook, installed once by the first
+  `xray_core_new` and chaining the previous hook, records every panic in the
+  process, task panics Tokio catches included, with message, location, thread
+  and up to 32 frames / 8 KiB of image-relative backtrace. The core adds a
+  supervised runtime task (TUN loop, inbounds, observatory, TUN flows and fd
+  pumps, mux, MASQUE, pre-connections) that panicked or returned before stop,
+  a TUN fd loop that stopped on an I/O error, and counted DNS-anchor and
+  flow-budget failures. A bounded ring keeps 16 events and counts repeats;
+  messages are redacted (quoted text, addresses, domains, URLs, UUIDs,
+  key-like tokens). ABI 1.20 adds `CRASH_REPORTS` (bit 33),
+  `xray_set_crash_report_directory`, which mirrors the ring to
+  `xray-crash-report.json` with one bounded write and rename, moving the
+  previous process's file to `xray-crash-report.previous.json`, and
+  `xray_take_crash_reports`, which returns the new events as JSON and clears
+  them. Swift: `XrayCore.setCrashReportDirectory(_:)`, `takeCrashReports()`
+  and `readCrashReport(at:)`.
 - The observatory skips the scheduled probe of a balancer's member while no
   flow has been routed through the balancer since that member's last probe,
   so a phone nobody uses no longer wakes its radio every `probeInterval`

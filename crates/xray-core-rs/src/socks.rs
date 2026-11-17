@@ -320,7 +320,9 @@ pub async fn serve_socks_listener(
                 });
             }
             joined = connections.join_next(), if !connections.is_empty() => {
-                let _ = joined;
+                if let Some(Err(error)) = joined {
+                    crate::crash_report::record_join_error("SOCKS inbound connection task", error);
+                }
             }
         }
     }

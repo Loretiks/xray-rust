@@ -379,7 +379,7 @@ impl Parent {
             drained: Notify::new(),
         });
         let driver = shared.clone();
-        let task = tokio::spawn(async move {
+        let driving = async move {
             struct Guard(Arc<Shared>);
             impl Drop for Guard {
                 fn drop(&mut self) {
@@ -395,7 +395,11 @@ impl Parent {
                 _ = write_loop(driver.clone(),write) => {},
                 _ = idle_loop(driver.clone()) => {},
             }
-        });
+        };
+        let task = tokio::spawn(crate::crash_report::catch_task_panic(
+            "VLESS mux connection",
+            driving,
+        ));
         Arc::new(Self {
             shared,
             task: Mutex::new(Some(task)),
