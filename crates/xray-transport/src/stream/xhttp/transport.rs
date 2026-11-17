@@ -340,6 +340,17 @@ impl fmt::Debug for XhttpTransport {
 }
 
 impl XhttpTransport {
+    /// Retires the connections this transport pools after a network change,
+    /// so the next request dials over the network the device is on now:
+    /// HTTP/1.1, HTTP/2 and HTTP/3 alike, though a QUIC connection could
+    /// move, because a fresh one costs one round trip where a migration the
+    /// server does not complete leaves requests waiting for the idle
+    /// timeout. Streams already open keep their connections until they end.
+    /// Returns how many pooled connections were dropped.
+    pub async fn reset_pool(&self) -> u64 {
+        self.xmux.reset().await
+    }
+
     pub fn new(
         config: XhttpConfig,
         endpoint: XhttpEndpoint,
@@ -2499,6 +2510,18 @@ impl XmuxManager {
         })
     }
 
+    /// Retires every client: none takes a new request, and each drops the
+    /// connections it pools. Returns how many pooled connections were
+    /// dropped.
+    async fn reset(&self) -> u64 {
+        let retired = std::mem::take(&mut *self.clients.lock().await);
+        let mut dropped = 0;
+        for client in retired {
+            dropped += client.retire().await;
+        }
+        dropped
+    }
+
     async fn select_client(
         &self,
     ) -> Result<(Arc<XmuxClient>, XmuxUsageLease), XhttpTransportError> {
@@ -2633,6 +2656,17 @@ impl XmuxClient {
 
     fn mark_closed(&self) {
         self.closed.store(true, Ordering::Release);
+    }
+
+    /// Takes no new request and drops the connections it pools. Requests
+    /// already under way keep their own handles, and with them their
+    /// connections, until they end. Returns how many were dropped.
+    async fn retire(&self) -> u64 {
+        self.mark_closed();
+        let h1 = std::mem::take(&mut *self.h1_pool.idle.lock().await).len();
+        let h2 = std::mem::take(&mut self.h2_pool.state.lock().await.connections).len();
+        let h3 = std::mem::take(&mut self.h3_pool.state.lock().await.connections).len();
+        (h1 + h2 + h3) as u64
     }
 
     async fn h2_client(&self, dial: XhttpDial) -> Result<H2Checkout, XhttpTransportError> {

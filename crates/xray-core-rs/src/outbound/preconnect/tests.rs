@@ -69,7 +69,7 @@ fn spec(port: u16) -> DialSpec {
 
 async fn take(pool: &PreConnections, fake: &Arc<Fake>, port: u16) -> Result<u8, CoreError> {
     let opener = Arc::clone(fake) as Arc<dyn Opener>;
-    let mut stream = pool.take(spec(port), || opener).await?;
+    let mut stream = pool.take(spec(port), || Arc::clone(&opener)).await?;
     let mut number = [0];
     stream.read_exact(&mut number).await.unwrap();
     // Keep the stream open, as a request using it would. The fake holds it
@@ -243,6 +243,32 @@ async fn close_stops_the_dialers_and_closes_what_they_hold() {
 }
 
 /// Dialers end once the outbound is gone, and requests then fail at once.
+/// A network change closes what the dialers hold, which they opened over
+/// the network the device left; the next request starts them again, and
+/// the outbound stays open.
+#[tokio::test(start_paused = true)]
+async fn a_reset_closes_what_the_dialers_hold_and_the_next_request_dials_again() {
+    let fake = Arc::new(Fake::default());
+    let pool = PreConnections::new(1).unwrap();
+    assert_eq!(pool.reset(), 0, "nothing runs before the first request");
+    assert_eq!(take(&pool, &fake, 443).await.unwrap(), 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    settle().await;
+    assert_eq!(fake.opened(), 2);
+
+    assert_eq!(pool.reset(), 1);
+    settle().await;
+    assert!(fake.closed(1).await, "the held connection is closed");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(fake.opened(), 2, "nothing dials until a request");
+
+    // The next request is served by a dialer started for it.
+    assert_eq!(take(&pool, &fake, 443).await.unwrap(), 2);
+    pool.close();
+    pool.join().await;
+    assert_eq!(pool.reset(), 0, "a closed pool stays closed");
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_outbound_gone_ends_the_dialers() {
     let fake = Arc::new(Fake::default());

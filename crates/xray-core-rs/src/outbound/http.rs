@@ -95,6 +95,14 @@ impl HttpOutbound {
         shared.client = None;
     }
 
+    /// Forgets the shared HTTP/2 connection after a network change, so the
+    /// next tunnel opens a new one; tunnels open on it keep it until they
+    /// end. Returns 1 if there was one.
+    pub(crate) fn reset_sessions(&self) -> u64 {
+        let mut shared = self.0.http2.lock().unwrap_or_else(PoisonError::into_inner);
+        u64::from(shared.client.take().is_some())
+    }
+
     /// Whether a custom header names the connection's source, which then has
     /// to reach [`Self::open`].
     pub(crate) fn names_the_client(&self) -> bool {

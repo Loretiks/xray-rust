@@ -796,7 +796,7 @@ impl TransportDialer {
 
     /// Whether this dialer reaches its servers through another outbound,
     /// which resolves their names at its far end.
-    pub(crate) fn is_chained(&self) -> bool {
+    pub fn is_chained(&self) -> bool {
         self.resolved_tcp_connector.is_some()
     }
 

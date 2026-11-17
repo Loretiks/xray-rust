@@ -91,7 +91,9 @@ owns input, profile storage and the existing DNS bootstrap/startup path.
   startup probe, blocking on-demand outbound probe (ABI 1.9) with in-flight
   cancellation (ABI 1.15), TUN MTU (ABI 1.16, `tunMtu()` override of the
   provider), the runtime's worker threads (ABI 1.18, `runtimeWorkerThreads`
-  of the `XrayCore` initializers; 2 by default on iOS and tvOS), and optional
+  of the `XrayCore` initializers; 2 by default on iOS and tvOS), recovery
+  from a network change without a restart (ABI 1.19, `networkChanged()`,
+  see [network change](../../docs/ffi.md#network-change)), and optional
   Darwin-utun fd discovery.
 - `XrayAppleShared`: profile/config models, secure config storage, sanitized
   logging, and app-to-extension message keys.

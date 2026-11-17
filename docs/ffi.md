@@ -8,7 +8,7 @@ source of truth for declarations and enum values.
 ## ABI version
 
 Call `xray_ffi_version_major()` and `xray_ffi_version_minor()` before creating a
-handle. The current ABI version is `1.18`. The checked-in Swift and JNI adapters
+handle. The current ABI version is `1.19`. The checked-in Swift and JNI adapters
 reject any major other than `1` and require minor `1` or newer. Their selector
 and health methods require the corresponding ABI 1.2 capability bits; their
 connection-management methods require the ABI 1.3 capability bit, and routing
@@ -32,6 +32,8 @@ VLESS link import requires minor >=17, `PROFILE_IMPORT` and
 `VLESS_PROFILE_IMPORT` (bit 30); see the [format contract](vless-profile-import.md).
 Setting the runtime's worker threads requires minor >=18 and
 `RUNTIME_WORKER_THREADS` (bit 31); see [runtime worker threads](#runtime-worker-threads).
+Recovering from a network change in one call requires minor >=19 and
+`NETWORK_CHANGE` (bit 32); see [network change](#network-change).
 
 An incompatible function signature, enum representation, ownership rule, or
 required struct layout requires a major version change. Consumers should
@@ -48,8 +50,9 @@ from the header and preserve/ignore unknown bits. A capability bit is added in
 the same change as its optional API; it does not override major/minor
 compatibility checks. Bits 0 to 30 are constants of the `XrayFfiCapability`
 enum. A C enum constant is an `int`, so bits from 31 on are 64-bit macros
-instead (`#define XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS 0x80000000ULL`),
-which Swift imports as `UInt64`.
+instead (`#define XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS 0x80000000ULL`,
+`#define XRAY_FFI_CAPABILITY_NETWORK_CHANGE 0x100000000ULL`), which Swift
+imports as `UInt64`.
 
 ## Offline profile import
 
@@ -124,6 +127,52 @@ The development 0.8 Kotlin adapter now exposes both `rebindHysteria()` and
 lifecycle protection as Swift. Android hosts own `ConnectivityManager` registration,
 usable-network selection, event coalescing and callback teardown; see the
 [Android integration notes](../platform/android/README.md#network-changes-and-hysteria-limits).
+
+### Network change
+
+ABI 1.19 adds `xray_core_network_changed(handle, error)`, capability bit 32
+`NETWORK_CHANGE`, and Swift `XrayCore.networkChanged()`. It is the one call
+for a host that sees the device change networks (Wi-Fi to cellular and back,
+a network that came back) and keeps the core running, which keeps the
+fake-IP mappings apps hold. On a loaded core it:
+
+- retires every pooled carrier session while the outbounds stay open, where
+  stopping the core closes them for good: Mux.Cool and XUDP parents close
+  with their children (a child cannot move to another parent) and a cold
+  connect of a parent under way is abandoned; `testpre` connections held
+  ahead close and the next request starts the dialers again; gRPC, XHTTP
+  (HTTP/1.1, HTTP/2 and HTTP/3) and an HTTP proxy's shared HTTP/2
+  connection leave their pools, keeping only the streams already open on
+  them, and a gRPC dial under way is superseded, its waiters dialing again.
+  The next flow dials over the network the device is on now;
+- moves Hysteria, WireGuard and the other QUIC carriers (XHTTP H3, MASQUE,
+  XDRIVE) to fresh sockets and tells mKCP connections, exactly as
+  `xray_core_rebind_hysteria` and `xray_core_rebind_wireguard` do;
+- drops the cached answers and failures of the destination and bootstrap
+  resolvers, so names (the proxy's server among them) are looked up over the
+  new network: a NAT64 address of cellular, or a failure cached for 30 s
+  while the network was gone, would otherwise outlive it. Fake-IP mappings
+  are kept;
+- on a running core, starts warming one connection to the proxy the latest
+  TUN TCP flow went through, or the default outbound when it is a proxy: the
+  server is looked up again and, for an outbound with its own TCP
+  connection per stream (RAW, WebSocket, HTTPUpgrade, without a chain or a
+  split download), one connection with its TLS or REALITY and transport
+  handshakes is opened and held for the next flow to the same server for
+  2.5 s, below the 4 s an Xray-core server waits for a request. Warming
+  runs in the background, at most 5 s; the next call or a stop cancels it.
+  gRPC and XHTTP outbounds only have their server looked up; Hysteria,
+  WireGuard and MASQUE are rebound instead;
+- has the runtime log time the next eight TCP flows again (see
+  [TUN](architecture.md#tun)).
+
+The call returns once the resets are done, without waiting for the warm-up.
+Flows already open are left to the host, which can close them with
+`xray_core_close_connection` so their apps reconnect at once. On a stopped
+core it changes nothing. It is a shared call: it may overlap data-path,
+snapshot and other shared calls but not lifecycle calls or
+`xray_core_free`, and must not be made from a runtime worker. A host that
+targets an older minor keeps calling the two rebind functions.
 
 ### Hysteria concurrency limits
 

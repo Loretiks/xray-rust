@@ -10,6 +10,41 @@ long-term supported release series.
 
 ## Unreleased
 
+- ABI 1.19 adds `xray_core_network_changed(handle, error)` (`NETWORK_CHANGE`,
+  bit 32, a 64-bit macro) and Swift `XrayCore.networkChanged()`, one call
+  for a host that sees the device change networks and keeps the core (and
+  the fake-IP mappings apps hold) running. It retires pooled carrier
+  sessions without closing the outbounds: Mux.Cool and XUDP parents close
+  with their children and a cold parent connect under way is abandoned,
+  `testpre` connections held ahead close, and gRPC, XHTTP (HTTP/1.1, 2 and
+  3) and HTTP/2 proxy connections leave their pools, keeping the streams
+  open on them, so the next flow dials over the new network; until now
+  only stopping the core closed them, for good. It rebinds Hysteria,
+  WireGuard and the other QUIC carriers as the two rebind calls do, drops
+  cached DNS answers and failures (a NAT64 address or a failure cached for
+  30 s while the network was gone no longer outlives it), and on a running
+  core warms one connection to the proxy the latest TCP flow used in the
+  background (at most 5 s; held 2.5 s for the next flow, which then skips
+  its TCP, TLS or REALITY and transport handshakes). The runtime log times
+  the eight TCP flows after a change as after a start.
+- A TCP connect that has had no answer for 1.5 s opens a second socket to
+  the same address beside the first, and the first connection either makes
+  wins. On iOS the first exchange after a tunnel start was sometimes slow
+  (16 of 109 starts in the 0.10.0 device runs took 2 s or more), and in the
+  three that failed the core took the app's connection but its outbound
+  never reached the server, while the run's next attempt passed. The most
+  likely cause is the route the core's socket took: a socket keeps it for
+  all its SYN retransmissions, and one taken while the tunnel comes up, or
+  while the phone moves between Wi-Fi and cellular, can lead nowhere. This
+  is not proven on a device; the timing lines below are there to confirm it.
+  A connect that is answered, refused included, within 1.5 s opens one
+  socket as before.
+- With the runtime log on, the first eight TCP flows after a start each get
+  an `info` line that splits their time into `accepted` (the host's and the
+  system's part), `sniff`, `route`, `resolve`, `dial` and `firstByte`, so a
+  slow first exchange on a device shows where it waited. `RuntimeLogger`
+  gains an `info` level.
+
 - Security: the vendored quinn-proto moves from 0.11.16 to 0.11.19 and quinn
   from 0.11.9 to 0.11.12, keeping the local patches. 0.11.16 let a peer grow
   queues without bound with empty DATAGRAM frames (RUSTSEC-2026-0342) or

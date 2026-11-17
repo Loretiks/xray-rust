@@ -122,6 +122,15 @@ directly rather than spawning detached tasks. Success, fatal socket-protection
 failure, caller cancellation, or dropping the dial future therefore cancels
 all losing attempts in place.
 
+Every TCP connect, raced or not, opens a second socket to the same address
+when the first has had no answer for 1.5 s (`STALLED_CONNECT_RETRY`), and
+the first connection either makes wins. A socket keeps the route it took at
+`connect` for all its SYN retransmissions; right after an iOS tunnel start,
+or while the phone moves between Wi-Fi and cellular, that route can lead
+nowhere while a socket opened a moment later gets through. A refusal or any
+other answer before then opens no second socket, and a connect that both
+sockets fail returns the first one's error.
+
 ### TUN
 
 The host either pushes and polls raw IP packets through the C ABI or registers a
@@ -145,6 +154,16 @@ at most once a second: a second after activity, every second while upload bytes
 wait for their outbound, and at the earliest close-wait or pooled-connection
 expiry. UDP flows end on their own idle timers. With no flows, or only idle
 ones, nothing wakes the loop.
+
+With the runtime log on, the first eight TCP flows after a start get one
+`info` line each that splits their time up, for the slow first exchange iOS
+sometimes shows after a tunnel start: `accepted` (from the start to the
+flow reaching the core: the host's and the system's part), `sniff`, `route`
+(choosing the outbound, with the lookups routing makes), `resolve` (looking
+the server up during the open), `dial` (the rest of the open: TCP connect,
+TLS or REALITY, the transport's and the protocol's handshakes) and
+`firstByte` (from the flow reaching the core to its first byte back), or the
+error the open ended with. Targets are redacted as in the other debug lines.
 
 The TUN MTU is a host runtime option (`TunRuntimeOptions::mtu`, 1280..=9000,
 default 1500), never Xray JSON, because the host also sets it on the interface.
@@ -458,6 +477,17 @@ process file-descriptor limit, with accept errors retried under backoff.
 Lifecycle/configuration operations are serialized by the host adapters.
 Documented data-path calls may run concurrently, but never concurrently with
 load/start/stop/set/free operations. See [the C ABI contract](ffi.md).
+
+A network change is a shared call (`Core::network_changed`), not a restart.
+The factory's per-leaf caches stay; each pool forgets what it holds: a Mux
+pool closes its parents and bumps a reset counter its cold connects watch,
+a `testpre` pool goes back to idle, gRPC, XHTTP and HTTP/2 pools drop their
+pooled connections while open streams keep their own handles, and the
+resolver caches drop their answers. Stopping the core is what closes the
+pools for good (`close_sessions`). The connection a change warms is a
+background task with a timeout whose abort handle the core keeps: the next
+change or a stop aborts it, and what it opens waits in the outbound's
+carrier, for a stream to the same server, no longer than 2.5 s.
 
 ## Platform boundary
 

@@ -23,12 +23,12 @@ fn loop_turns() -> u64 {
     LOOP_TURNS.with(Cell::get)
 }
 
-const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
-const CLIENT_PORT: u16 = 49_152;
-const TCP_FIN: u8 = 0x01;
-const TCP_SYN: u8 = 0x02;
-const TCP_PSH: u8 = 0x08;
-const TCP_ACK: u8 = 0x10;
+pub(super) const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
+pub(super) const CLIENT_PORT: u16 = 49_152;
+pub(super) const TCP_FIN: u8 = 0x01;
+pub(super) const TCP_SYN: u8 = 0x02;
+pub(super) const TCP_PSH: u8 = 0x08;
+pub(super) const TCP_ACK: u8 = 0x10;
 
 async fn started_core(outbound: &str) -> crate::Core {
     let raw =
@@ -135,7 +135,7 @@ async fn udp_flow_is_evicted_when_idle_and_the_loop_then_sleeps() {
     core.stop().await.unwrap();
 }
 
-fn tcp_segment(
+pub(super) fn tcp_segment(
     server: SocketAddrV4,
     sequence: u32,
     acknowledgement: u32,
@@ -170,7 +170,7 @@ fn received_segment(packet: &[u8]) -> Option<(u8, u32, Vec<u8>)> {
 }
 
 /// Polls the TUN until a segment matches, and returns it.
-async fn receive_segment(
+pub(super) async fn receive_segment(
     tun: &TunEndpoint,
     mut matches: impl FnMut(u8, &[u8]) -> bool,
 ) -> (u8, u32, Vec<u8>) {
