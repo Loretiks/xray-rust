@@ -58,6 +58,23 @@ long-term supported release series.
   config load, and Swift `XrayCore` initializers take an optional
   `runtimeWorkerThreads`. Selecting a profile or a count replaces the
   handle's still idle runtime when the count changes.
+- The observatory skips the scheduled probe of a balancer's member while no
+  flow has been routed through the balancer since that member's last probe,
+  so a phone nobody uses no longer wakes its radio every `probeInterval`
+  (10 seconds by default). The first round probes every observed outbound;
+  the first flow through a balancer whose members were skipped has them
+  probed at once, and failure re-probes run as before. Observed outbounds
+  outside every balancer keep the interval. Selecting through a balancer
+  records its use: one atomic load per flow once the current round has seen
+  one.
+- ABI 1.18 adds `xray_core_set_runtime_worker_threads`
+  (`RUNTIME_WORKER_THREADS`, bit 31, the first capability defined as a 64-bit
+  macro since a C enum constant cannot hold it) to set the FFI handle's Tokio
+  runtime to 1..=64 worker threads, or 0 for the default, before config load;
+  a count that differs replaces the handle's still idle runtime. Swift
+  `XrayCore` initializers and Kotlin `XrayCore.create` take an optional
+  `runtimeWorkerThreads`. The default stays the available parallelism within
+  2..=6 on every TUN runtime profile.
 - The TUN loop no longer wakes every second. It slept at most a second for
   its statistics, so an idle VPN, with no flows or only idle ones, woke the
   process 45 to 50 times a minute where the same core without TUN woke none
