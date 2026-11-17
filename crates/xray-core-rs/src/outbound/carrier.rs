@@ -42,6 +42,60 @@ pub(super) struct StreamCarrier {
     /// `sockopt.domainStrategy`, for the address a domain server resolves
     /// to.
     pub(super) domain_strategy: xray_config::DomainStrategy,
+    /// A connection [`Self::prewarm`] opened ahead for the next stream.
+    pub(super) warm: WarmSlot,
+}
+
+/// How long a connection opened ahead waits for a stream. An Xray-core
+/// server gives a client 4 s (its `handshake` policy) from accepting the
+/// connection to reading the request, so a connection held longer would be
+/// closed under the request that takes it.
+pub(crate) const WARM_CARRIER_LIFETIME: Duration = Duration::from_millis(2500);
+
+/// At most one carrier connection opened ahead, for the next stream.
+#[derive(Default)]
+pub(super) struct WarmSlot(std::sync::Mutex<Option<WarmCarrier>>);
+
+struct WarmCarrier {
+    stream: BoxedTransportStream,
+    /// The server address it is connected to.
+    server: Vec<SocketAddr>,
+    expires: tokio::time::Instant,
+}
+
+impl std::fmt::Debug for WarmSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        f.debug_struct("WarmSlot").field("held", &held).finish()
+    }
+}
+
+impl WarmSlot {
+    fn put(&self, warm: WarmCarrier) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(warm);
+    }
+
+    /// The connection held for `candidates`, unless it expired.
+    fn take(&self, candidates: &[SocketAddr]) -> Option<BoxedTransportStream> {
+        let warm = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        (tokio::time::Instant::now() < warm.expires
+            && warm
+                .server
+                .first()
+                .is_some_and(|server| candidates.contains(server)))
+        .then_some(warm.stream)
+    }
 }
 
 impl StreamCarrier {
@@ -110,6 +164,7 @@ impl StreamCarrier {
             socket_options: socket_options::compile(stream),
             address_port: address_port_strategy(stream),
             domain_strategy: domain_strategy(stream),
+            warm: WarmSlot::default(),
         })
     }
 
@@ -148,6 +203,21 @@ impl StreamCarrier {
         matches!(self.transport_layer, TransportLayer::Xhttp(_))
     }
 
+    /// Retires the connections the gRPC or XHTTP transport pools, the split
+    /// download's included, after a network change. Returns how many.
+    pub(super) async fn reset_pools(&self) -> u64 {
+        let upload = match &self.transport_layer {
+            TransportLayer::Grpc(grpc) => grpc.reset_pool().await,
+            TransportLayer::Xhttp(xhttp) => xhttp.reset_pool().await,
+            _ => 0,
+        };
+        let download = match &self.download {
+            Some(download) => download.transport.reset_pool().await,
+            None => 0,
+        };
+        upload + download
+    }
+
     /// The server's candidates, after its `addressPortStrategy`.
     pub(super) async fn resolve_server(
         &self,
@@ -180,7 +250,71 @@ impl StreamCarrier {
         }
     }
 
-    pub(super) async fn open(
+    /// Whether a connection this carrier opens can wait for the stream it
+    /// is for: one of its own over TCP, with nothing that names the stream
+    /// before its first bytes.
+    fn can_open_ahead(&self) -> bool {
+        self.download.is_none()
+            && matches!(
+                self.transport_layer,
+                TransportLayer::Raw
+                    | TransportLayer::RawHttpHeader(_)
+                    | TransportLayer::WebSocket(_)
+                    | TransportLayer::HttpUpgrade(_)
+            )
+    }
+
+    /// After a network change, looks the server up again and opens one
+    /// connection to it (TCP, then TLS or REALITY and the transport's
+    /// handshake) for the next stream to take within
+    /// [`WARM_CARRIER_LIFETIME`], so the first flow over the new network
+    /// does not pay for it. A carrier whose streams share pooled
+    /// connections (gRPC, XHTTP) or are not TCP only has its server looked
+    /// up. Returns whether a connection is held.
+    pub(super) async fn prewarm(
+        &self,
+        resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
+    ) -> Result<bool, CoreError> {
+        let candidates = self.resolve_server(resolver, dialer).await?;
+        if !self.can_open_ahead() || dialer.is_chained() {
+            return Ok(false);
+        }
+        let stream = self.open_new(&candidates, &[], dialer).await?;
+        self.warm.put(WarmCarrier {
+            stream,
+            server: candidates,
+            expires: tokio::time::Instant::now() + WARM_CARRIER_LIFETIME,
+        });
+        Ok(true)
+    }
+
+    /// A stream to the server: the connection opened ahead for it, else a
+    /// new one. Not an `async fn`, so the open futures of the protocols
+    /// built on it carry no state of their own for the choice.
+    pub(super) fn open<'a>(
+        &'a self,
+        candidates: &'a [SocketAddr],
+        download_candidates: &'a [SocketAddr],
+        dialer: &'a TransportDialer,
+    ) -> impl Future<Output = Result<BoxedTransportStream, CoreError>> + Send + 'a {
+        // A connection opened ahead went over the network without a chain.
+        let warm = if dialer.is_chained() {
+            None
+        } else {
+            self.warm.take(candidates)
+        };
+        match warm {
+            Some(stream) => futures_util::future::Either::Left(std::future::ready(Ok(stream))),
+            None => futures_util::future::Either::Right(self.open_new(
+                candidates,
+                download_candidates,
+                dialer,
+            )),
+        }
+    }
+
+    async fn open_new(
         &self,
         candidates: &[SocketAddr],
         download_candidates: &[SocketAddr],

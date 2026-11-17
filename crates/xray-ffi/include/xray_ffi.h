@@ -254,6 +254,8 @@ typedef enum XrayFfiCapability {
  * macros instead. */
 /* ABI 1.18: xray_core_set_runtime_worker_threads. */
 #define XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS 0x80000000ULL
+/* ABI 1.19: xray_core_network_changed. */
+#define XRAY_FFI_CAPABILITY_NETWORK_CHANGE 0x100000000ULL
 
 /* ABI 1.9. Outcome written by xray_core_probe_outbound_url through an int32_t.
  * Failure kinds mirror the outbound health snapshot's lastFailureKind. */
@@ -422,6 +424,19 @@ XrayStatus xray_core_rebind_hysteria(
     XrayCoreHandle *handle,
     uint64_t *accepted,
     XrayError **error);
+/* ABI 1.19, NETWORK_CHANGE. Recover from an OS network change without a
+ * restart, which would lose the fake-IP mappings apps hold: retire pooled
+ * carrier sessions (Mux.Cool/XUDP parents, testpre connections, gRPC, XHTTP
+ * and HTTP/2 pools) while the outbounds stay open; move Hysteria, WireGuard
+ * and the other QUIC carriers to fresh sockets as the two rebind calls do;
+ * drop cached DNS answers and failures (fake-IP mappings are kept); and on a
+ * running core warm one connection to the current proxy in the background,
+ * bounded by 5 s and held 2.5 s for the next flow. Returns once the resets
+ * are done; the next call or a stop cancels the warm-up. Open flows are left
+ * to xray_core_close_connection. No-op on a stopped core. Concurrent with
+ * data-path and shared calls, but not lifecycle/free; not from a runtime
+ * worker. */
+XrayStatus xray_core_network_changed(XrayCoreHandle *handle, XrayError **error);
 /* ABI 1.9, OUTBOUND_PROBE. Nonblocking, shared teardown preparation. Cancels
  * current AND future probes on a running core. ABI 1.12 also cancels preflight
  * startup probes before start; no-op when unloaded. Legacy start is unaffected.

@@ -49,6 +49,7 @@ fn ffi_header_declares_lifecycle_error_and_tun_abi() {
         "xray_core_close_connection",
         "xray_core_rebind_wireguard",
         "xray_core_rebind_hysteria",
+        "xray_core_network_changed",
         "xray_core_probe_outbound_url",
         "xray_core_cancel_outbound_probes",
         "xray_core_cancel_inflight_outbound_probes",
@@ -107,6 +108,7 @@ fn ffi_header_declares_lifecycle_error_and_tun_abi() {
     assert!(header.contains("XRAY_FFI_CAPABILITY_TUN_MTU = 1 << 29"));
     assert!(header.contains("XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT = 1 << 30"));
     assert!(header.contains("#define XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS 0x80000000ULL"));
+    assert!(header.contains("#define XRAY_FFI_CAPABILITY_NETWORK_CHANGE 0x100000000ULL"));
     assert!(header.contains("uint64_t udp_oversize_datagrams;"));
     // The Rust enum, the JNI result carrier and the Swift mapping all rely on
     // these discriminants staying stable within ABI major 1.
@@ -219,6 +221,9 @@ fn apple_adapter_declares_packet_tunnel_pump() {
     assert!(core.contains("xray_core_set_tun_runtime_profile"));
     assert!(core.contains("xray_core_set_runtime_worker_threads"));
     assert!(core.contains("public static let runtimeWorkerThreads"));
+    assert!(core.contains("xray_core_network_changed"));
+    assert!(core.contains("public static let networkChange"));
+    assert!(core.contains("public func networkChanged() throws"));
     assert!(core.contains("xray_core_set_dns_bootstrap_mode"));
     assert!(core.contains("public static let outboundSelection"));
     assert!(core.contains("public static let outboundHealth"));
@@ -1306,6 +1311,7 @@ const EXPORTED_SYMBOLS: &[&str] = &[
     "xray_core_close_connection",
     "xray_core_rebind_wireguard",
     "xray_core_rebind_hysteria",
+    "xray_core_network_changed",
     "xray_core_probe_outbound_url",
     "xray_core_cancel_outbound_probes",
     "xray_core_cancel_inflight_outbound_probes",
@@ -1401,6 +1407,7 @@ static void use_xray_ffi_api(void) {
   capabilities &= XRAY_FFI_CAPABILITY_TUN_MTU;
   capabilities &= XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT;
   capabilities &= XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS;
+  capabilities &= XRAY_FFI_CAPABILITY_NETWORK_CHANGE;
   capabilities &= XRAY_FFI_CAPABILITY_OUTBOUND_PROBE;
   (void)capabilities;
   (void)xray_profile_import_json(packet, sizeof(packet), NULL, 0, &written, &error);
@@ -1458,6 +1465,7 @@ static void use_xray_ffi_api(void) {
   (void)xray_core_close_connection(handle, 1, &error);
   (void)xray_core_rebind_wireguard(handle, &stats_probe, &error);
   (void)xray_core_rebind_hysteria(handle, &stats_probe, &error);
+  (void)xray_core_network_changed(handle, &error);
   {
     uint64_t probe_delay_ms = 0;
     int32_t probe_failure_kind = XRAY_OUTBOUND_PROBE_FAILURE_NONE;

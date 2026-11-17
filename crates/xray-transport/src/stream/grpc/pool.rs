@@ -137,6 +137,25 @@ impl GrpcTransport {
         }
     }
 
+    /// Forgets the pooled connection after a network change, so the next
+    /// flow dials a new one over the network the device is on now. Calls
+    /// already open on the old connection keep it until they end. A dial
+    /// under way is superseded: the flows waiting for it dial again, and
+    /// what it produces is dropped. Returns 1 if there was a connection or a
+    /// dial to forget, 0 otherwise.
+    pub async fn reset_pool(&self) -> u64 {
+        let mut state = self.pool.state.lock().await;
+        match std::mem::replace(&mut *state, PoolState::Empty) {
+            PoolState::Empty => 0,
+            PoolState::Ready(_) => 1,
+            PoolState::Dialing(attempt) => {
+                drop(state);
+                attempt.complete(DialOutcome::Superseded);
+                1
+            }
+        }
+    }
+
     /// Opens one flow, dialling only if the pool has nothing live.
     ///
     /// `pub(crate)` because its one caller anywhere is
@@ -260,6 +279,8 @@ enum PoolState {
 enum DialOutcome {
     Pending,
     Ready,
+    /// A reset forgot the attempt: its waiters look at the pool again.
+    Superseded,
     Failed(Arc<str>),
 }
 
@@ -282,7 +303,7 @@ impl DialAttempt {
         loop {
             match outcome.borrow().clone() {
                 DialOutcome::Pending => {}
-                DialOutcome::Ready => return Ok(()),
+                DialOutcome::Ready | DialOutcome::Superseded => return Ok(()),
                 DialOutcome::Failed(reason) => {
                     return Err(TransportError::Grpc(reason.to_string()))
                 }

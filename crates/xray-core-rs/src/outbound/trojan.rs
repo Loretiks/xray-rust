@@ -54,6 +54,11 @@ impl TrojanOutbound {
             m.close();
         }
     }
+    /// Closes the pooled sessions after a network change, keeping the
+    /// outbound open: see [`super::mux::Pool::reset`].
+    pub(super) fn reset_sessions(&self) -> u64 {
+        self.0.mux.as_ref().map_or(0, super::mux::Runtime::reset)
+    }
     pub(super) async fn join(&self) {
         if let Some(m) = &self.0.mux {
             m.join().await;

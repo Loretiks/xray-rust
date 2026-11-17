@@ -98,51 +98,24 @@ impl PreConnections {
     pub(super) async fn take(
         &self,
         spec: DialSpec,
-        start: impl FnOnce() -> Arc<dyn Opener>,
+        start: impl Fn() -> Arc<dyn Opener>,
     ) -> Result<BoxedTransportStream, CoreError> {
-        let requests = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            match &mut *state {
-                State::Closed => return Err(closed()),
-                State::Running {
-                    spec: latest,
-                    requests,
-                    ..
-                } => {
-                    latest.send_replace(Arc::new(spec));
-                    requests.clone()
-                }
-                State::Idle => {
-                    let (latest, spec) = watch::channel(Arc::new(spec));
-                    let (requests, queue) = mpsc::unbounded_channel();
-                    let queue = Arc::new(tokio::sync::Mutex::new(queue));
-                    let opener = start();
-                    let dialers = (0..self.dialers)
-                        .map(|_| {
-                            tokio::spawn(dial(
-                                spec.clone(),
-                                Arc::clone(&queue),
-                                Arc::clone(&opener),
-                            ))
-                        })
-                        .collect();
-                    let sender = requests.clone();
-                    *state = State::Running {
-                        spec: latest,
-                        requests,
-                        dialers,
-                    };
-                    sender
-                }
-            }
-        };
+        let spec = Arc::new(spec);
+        let mut requests = self.requests(&spec, &start)?;
         let deadline = Instant::now() + WAIT;
         loop {
             let (request, response) = oneshot::channel();
-            requests.send(request).map_err(|_| closed())?;
+            if requests.send(request).is_err() {
+                // The dialers a reset stopped: ask the ones it starts.
+                requests = self.requests(&spec, &start)?;
+                continue;
+            }
             let ready = match tokio::time::timeout_at(deadline, response).await {
                 Ok(Ok(ready)) => ready,
-                Ok(Err(_)) => return Err(closed()),
+                Ok(Err(_)) => {
+                    requests = self.requests(&spec, &start)?;
+                    continue;
+                }
                 Err(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -156,6 +129,72 @@ impl PreConnections {
                 return Ok(ready.stream);
             }
         }
+    }
+
+    /// Where requests go: the running dialers, after handing them `spec`,
+    /// or new ones that `start` makes the opener of.
+    fn requests(
+        &self,
+        spec: &Arc<DialSpec>,
+        start: &impl Fn() -> Arc<dyn Opener>,
+    ) -> Result<mpsc::UnboundedSender<Request>, CoreError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match &mut *state {
+            State::Closed => Err(closed()),
+            // Every dialer ended: the outbound is gone.
+            State::Running { requests, .. } if requests.is_closed() => Err(closed()),
+            State::Running {
+                spec: latest,
+                requests,
+                ..
+            } => {
+                latest.send_replace(Arc::clone(spec));
+                Ok(requests.clone())
+            }
+            State::Idle => {
+                let (latest, spec) = watch::channel(Arc::clone(spec));
+                let (requests, queue) = mpsc::unbounded_channel();
+                let queue = Arc::new(tokio::sync::Mutex::new(queue));
+                let opener = start();
+                let dialers = (0..self.dialers)
+                    .map(|_| {
+                        tokio::spawn(dial(spec.clone(), Arc::clone(&queue), Arc::clone(&opener)))
+                    })
+                    .collect();
+                let sender = requests.clone();
+                *state = State::Running {
+                    spec: latest,
+                    requests,
+                    dialers,
+                };
+                Ok(sender)
+            }
+        }
+    }
+
+    /// Stops the dialers and closes the connections they hold after a
+    /// network change, which they opened over the network the device left.
+    /// The next request starts dialers again. Returns how many dialers were
+    /// stopped.
+    pub(super) fn reset(&self) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(&*state, State::Running { .. }) {
+            return 0;
+        }
+        let State::Running { dialers, .. } = std::mem::replace(&mut *state, State::Idle) else {
+            unreachable!("checked above");
+        };
+        drop(state);
+        for dialer in &dialers {
+            dialer.abort();
+        }
+        let count = dialers.len() as u64;
+        let mut stopped = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
+        // Those an earlier reset stopped that are done need no join, so
+        // many changes do not pile them up.
+        stopped.retain(|dialer| !dialer.is_finished());
+        stopped.extend(dialers);
+        count
     }
 
     /// Stops the dialers and closes the connections they hold.

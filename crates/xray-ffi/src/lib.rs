@@ -30,7 +30,7 @@ use xray_tun::TunTcpSlowFlowKind;
 use zeroize::Zeroize;
 
 pub const XRAY_FFI_ABI_MAJOR: u32 = 1;
-pub const XRAY_FFI_ABI_MINOR: u32 = 18;
+pub const XRAY_FFI_ABI_MINOR: u32 = 19;
 
 pub const XRAY_FFI_CAPABILITY_CONFIG_WARNINGS: u64 = 1 << 0;
 pub const XRAY_FFI_CAPABILITY_GEODATA_SEARCH: u64 = 1 << 1;
@@ -66,6 +66,8 @@ pub const XRAY_FFI_CAPABILITY_TUN_MTU: u64 = 1 << 29;
 pub const XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT: u64 = 1 << 30;
 /// ABI 1.18: `xray_core_set_runtime_worker_threads`.
 pub const XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS: u64 = 1 << 31;
+/// ABI 1.19: `xray_core_network_changed`.
+pub const XRAY_FFI_CAPABILITY_NETWORK_CHANGE: u64 = 1 << 32;
 
 pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_CONFIG_WARNINGS
     | XRAY_FFI_CAPABILITY_GEODATA_SEARCH
@@ -98,7 +100,8 @@ pub const XRAY_FFI_CAPABILITIES: u64 = XRAY_FFI_CAPABILITY_CONFIG_WARNINGS
     | XRAY_FFI_CAPABILITY_OUTBOUND_PROBE_CANCEL
     | XRAY_FFI_CAPABILITY_TUN_MTU
     | XRAY_FFI_CAPABILITY_VLESS_PROFILE_IMPORT
-    | XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS;
+    | XRAY_FFI_CAPABILITY_RUNTIME_WORKER_THREADS
+    | XRAY_FFI_CAPABILITY_NETWORK_CHANGE;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1635,6 +1638,46 @@ pub unsafe extern "C" fn xray_core_rebind_hysteria(
             // carrier takes it; the name is from when Hysteria's was the
             // only one that could.
             *accepted = core.rebind_hysteria() + core.rebind_quic();
+            XrayStatus::Ok
+        })
+    }
+}
+
+/// Recovers a loaded core from an OS network change without a restart (ABI
+/// 1.19, `NETWORK_CHANGE`): retires its pooled carrier sessions (Mux.Cool and
+/// XUDP parents, `testpre` connections, gRPC, XHTTP and HTTP/2 pools) while
+/// keeping the outbounds open, moves Hysteria, WireGuard and the other QUIC
+/// carriers to fresh sockets as `xray_core_rebind_hysteria` and
+/// `xray_core_rebind_wireguard` do, drops cached DNS answers and failures
+/// (fake-IP mappings are kept), and on a running core starts warming one
+/// connection to the current proxy in the background, at most 5 s, for the
+/// next flow. Returns once the resets are done, without waiting for the
+/// warm-up; the next call or a stop cancels it. Flows already open are left
+/// to the host (`xray_core_close_connection`). A no-op on a stopped core.
+///
+/// # Safety
+/// `handle` must be null or live. A shared call: it may overlap data-path,
+/// snapshot and other shared calls, but not lifecycle calls or
+/// `xray_core_free`. Do not call it from a runtime worker. If `error` is
+/// non-null it must point to an initialized, library-owned error pointer or
+/// null, exclusively accessible by this call.
+#[no_mangle]
+pub unsafe extern "C" fn xray_core_network_changed(
+    handle: *mut XrayCoreHandle,
+    error: *mut *mut XrayError,
+) -> XrayStatus {
+    unsafe {
+        ffi_status(error, || {
+            clear_error(error);
+            let handle = match shared_handle(handle, error) {
+                Ok(handle) => handle,
+                Err(status) => return status,
+            };
+            let core = match loaded_core(handle, error) {
+                Ok(core) => core,
+                Err(status) => return status,
+            };
+            handle.runtime.block_on(core.network_changed());
             XrayStatus::Ok
         })
     }

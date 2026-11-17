@@ -164,6 +164,17 @@ pub trait DnsResolver: Send + Sync {
         let lookup = self.resolve_all(domain, port).await?;
         filter_dns_lookup_by_strategy(lookup, domain, port, strategy)
     }
+
+    /// Forgets the answers this resolver, and any it asks, keeps, after the
+    /// device changed networks: an address one network's DNS gave (a NAT64
+    /// synthesis on cellular, a nearer edge) need not work on the other, and
+    /// a lookup that failed while the network was gone would otherwise keep
+    /// failing for its negative TTL. Lookups in flight finish for their
+    /// callers without being kept. Returns how many answers were dropped.
+    /// Resolvers that keep nothing need not implement it.
+    fn forget_cached_answers(&self) -> usize {
+        0
+    }
 }
 
 /// Narrows every lookup to the address families the system has a route
@@ -211,6 +222,10 @@ impl DnsResolver for SystemRouteDnsResolver {
         self.inner
             .resolve_all_with_strategy(domain, port, strategy)
             .await
+    }
+
+    fn forget_cached_answers(&self) -> usize {
+        self.inner.forget_cached_answers()
     }
 }
 
@@ -656,6 +671,19 @@ impl DnsResolver for CachingDnsResolver {
         self.resolve_all(domain, port)
             .await?
             .first_socket_addr(domain, port)
+    }
+
+    fn forget_cached_answers(&self) -> usize {
+        let dropped = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A leader no longer listed keeps its outcome to its waiters.
+            state.in_flight.clear();
+            std::mem::take(&mut state.resolved).len()
+        };
+        dropped + self.inner.forget_cached_answers()
     }
 
     async fn resolve_all(&self, domain: &str, port: u16) -> Result<DnsLookup, TransportError> {
@@ -2419,6 +2447,10 @@ impl DnsResolver for ConfiguredDnsResolver {
         self.resolve_all(domain, port)
             .await?
             .first_socket_addr(domain, port)
+    }
+
+    fn forget_cached_answers(&self) -> usize {
+        self.fallback.forget_cached_answers()
     }
 
     async fn resolve_all(&self, domain: &str, port: u16) -> Result<DnsLookup, TransportError> {
@@ -6165,6 +6197,43 @@ mod tests {
             );
         }
         assert_eq!(inner.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// After a network change the cache asks again, for an answer and for
+    /// a failure it would otherwise keep for 30 s; a wrapper passes the
+    /// request on to the cache it fronts.
+    #[tokio::test]
+    async fn a_forgetful_cache_asks_again_after_a_network_change() {
+        let inner = Arc::new(DelayedCountingResolver {
+            calls: AtomicUsize::new(0),
+            result: Some(SocketAddr::from(([192, 0, 2, 62], 0))),
+        });
+        let cache = Arc::new(CachingDnsResolver::new(inner.clone()));
+        let resolver = SystemRouteDnsResolver::new(cache.clone(), ScriptedRoutes::new(true, true));
+        resolver.resolve("moved.example", 443).await.unwrap();
+        resolver.resolve("moved.example", 443).await.unwrap();
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 1);
+
+        assert_eq!(resolver.forget_cached_answers(), 1);
+        resolver.resolve("moved.example", 443).await.unwrap();
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 2);
+
+        let failing = Arc::new(DelayedNameErrorResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let cache = CachingDnsResolver::new(failing.clone());
+        cache.resolve("down.example", 443).await.unwrap_err();
+        cache.resolve("down.example", 443).await.unwrap_err();
+        assert_eq!(
+            failing.calls.load(Ordering::Relaxed),
+            1,
+            "the failure is kept"
+        );
+        assert_eq!(cache.forget_cached_answers(), 1);
+        cache.resolve("down.example", 443).await.unwrap_err();
+        assert_eq!(failing.calls.load(Ordering::Relaxed), 2, "and forgotten");
+        assert_eq!(cache.forget_cached_answers(), 1);
+        assert_eq!(cache.forget_cached_answers(), 0);
     }
 
     #[tokio::test]
